@@ -1,0 +1,47 @@
+{
+  "name": "pi-iterm2",
+  "version": "0.1.0",
+  "description": "Color-code iTerm2 tabs by host, session, and live agent status for the Pi coding agent.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "iterm2",
+    "terminal"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dreveman/pi-iterm2.git"
+  },
+  "homepage": "https://github.com/dreveman/pi-iterm2#readme",
+  "bugs": {
+    "url": "https://github.com/dreveman/pi-iterm2/issues"
+  },
+  "files": [
+    "extensions/*.ts",
+    "test/*.ts",
+    "macos/*.py",
+    "tsconfig.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "smoke": "pi --no-extensions --offline -e . --list-models",
+    "test": "pi --no-extensions --offline -e ./test/run.ts --list-models",
+    "verify": "npm run check && npm test && npm run smoke"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.19",
+    "typescript": "^5.9.3"
+  }
+}
