@@ -15,6 +15,8 @@ import {
 	deriveStatus,
 	hashString,
 	hostHue,
+	parseColorSpec,
+	rgbToHue,
 	hslToRgb,
 	parseConfig,
 	parseConfigText,
@@ -64,11 +66,12 @@ test("hslToRgb matches known primary colors", () => {
 });
 
 test("computeTabColorRgb varies by host, session, and status but is stable for the same inputs", () => {
-	const base = computeTabColorRgb("host-a", "session-1", "idle");
-	assert.deepEqual(computeTabColorRgb("host-a", "session-1", "idle"), base);
-	assert.notDeepEqual(computeTabColorRgb("host-b", "session-1", "idle"), base);
-	assert.notDeepEqual(computeTabColorRgb("host-a", "session-2", "idle"), base);
-	assert.notDeepEqual(computeTabColorRgb("host-a", "session-1", "working"), base);
+	const cfg = DEFAULT_CONFIG;
+	const base = computeTabColorRgb(cfg, "host-a", "session-1", "idle");
+	assert.deepEqual(computeTabColorRgb(cfg, "host-a", "session-1", "idle"), base);
+	assert.notDeepEqual(computeTabColorRgb(cfg, "host-b", "session-1", "idle"), base);
+	assert.notDeepEqual(computeTabColorRgb(cfg, "host-a", "session-2", "idle"), base);
+	assert.notDeepEqual(computeTabColorRgb(cfg, "host-a", "session-1", "working"), base);
 });
 
 test("deriveStatus prioritizes waiting, then running, then a sticky error, then idle", () => {
@@ -162,7 +165,7 @@ test("buildStatusSequences publishes pi_status for every status, not just idle",
 
 test("buildStatusSequences batches tab color and pi_status into one string", () => {
 	const seq = buildStatusSequences(DEFAULT_CONFIG, IDENTITY, "s1", "working");
-	assert.equal(seq.includes(buildTabColorSequence(computeTabColorRgb("box", "s1", "working"))), true);
+	assert.equal(seq.includes(buildTabColorSequence(computeTabColorRgb(DEFAULT_CONFIG, "box", "s1", "working"))), true);
 	// One batch means wrapForTmux wraps once, per its documented contract.
 	assert.equal(wrapForTmux(seq, true).match(/\x1bPtmux;/g)?.length, 1);
 });
@@ -203,6 +206,74 @@ test("parseConfig never hands back the shared DEFAULT_CONFIG reference", () => {
 	assert.equal(DEFAULT_CONFIG.tabColor, true);
 	const invalid = parseConfigText("{").config;
 	assert.notEqual(invalid, DEFAULT_CONFIG);
+	// The nested containers must be fresh too; a shallow copy would share them.
+	const a = parseConfig({}).config;
+	const b = parseConfig({}).config;
+	a.palette.push(123);
+	a.hostColors.x = 5;
+	assert.deepEqual(b.palette, []);
+	assert.deepEqual(b.hostColors, {});
+	assert.deepEqual(DEFAULT_CONFIG.palette, []);
+});
+
+test("parseColorSpec accepts hues and #rrggbb, and rejects junk", () => {
+	assert.equal(parseColorSpec(210), 210);
+	assert.equal(parseColorSpec(-30), 330); // wraps into range
+	assert.equal(parseColorSpec(400), 40);
+	assert.equal(parseColorSpec("#ff0000"), 0);
+	assert.equal(parseColorSpec("00ff00"), 120); // leading # optional
+	assert.equal(parseColorSpec("#0000FF"), 240);
+	assert.equal(parseColorSpec("#808080"), 0); // grey has no hue
+	for (const junk of ["red", "#fff", "#gggggg", "", null, undefined, {}, true]) {
+		assert.equal(parseColorSpec(junk), undefined, `should reject ${JSON.stringify(junk)}`);
+	}
+});
+
+test("palette constrains host hues to the configured set", () => {
+	const { config } = parseConfig({ palette: ["#ff0000", 120, "#0000ff"] });
+	assert.deepEqual(config.palette, [0, 120, 240]);
+	for (const host of ["a", "b", "c", "nvidia", "mbp", "prod-box"]) {
+		assert.equal(config.palette.includes(hostHue(host, config.palette, config.hostColors)), true);
+	}
+});
+
+test("hostColors pins a specific host and outranks the palette", () => {
+	const { config } = parseConfig({ palette: ["#ff0000"], hostColors: { nvidia: "#0000ff" } });
+	assert.equal(hostHue("nvidia", config.palette, config.hostColors), 240);
+	assert.equal(hostHue("other", config.palette, config.hostColors), 0);
+});
+
+test("sessionHueSpread 0 pins every session to the host hue exactly", () => {
+	const { config } = parseConfig({ hostColors: { h: 200 }, sessionHueSpread: 0 });
+	const a = computeTabColorRgb(config, "h", "session-1", "idle");
+	const b = computeTabColorRgb(config, "h", "session-2", "idle");
+	assert.deepEqual(a, b);
+	assert.deepEqual(a, hslToRgb(200, 45, 30));
+	// The default spread keeps them distinguishable.
+	const spread = parseConfig({ hostColors: { h: 200 } }).config;
+	assert.notDeepEqual(
+		computeTabColorRgb(spread, "h", "session-1", "idle"),
+		computeTabColorRgb(spread, "h", "session-2", "idle"),
+	);
+});
+
+test("status still modulates brightness on top of a pinned host color", () => {
+	const { config } = parseConfig({ hostColors: { h: 200 }, sessionHueSpread: 0 });
+	const idle = computeTabColorRgb(config, "h", "s", "idle");
+	const working = computeTabColorRgb(config, "h", "s", "working");
+	assert.notDeepEqual(idle, working);
+	assert.equal(rgbToHue(idle), rgbToHue(working)); // same hue, different brightness
+});
+
+test("palette/hostColors/sessionHueSpread reject invalid input with a warning", () => {
+	assert.ok(parseConfig({ palette: [] }).warning);
+	assert.ok(parseConfig({ palette: "blue" }).warning);
+	assert.ok(parseConfig({ palette: ["nope"] }).warning);
+	assert.ok(parseConfig({ hostColors: [] }).warning);
+	assert.ok(parseConfig({ hostColors: { h: "nope" } }).warning);
+	assert.ok(parseConfig({ sessionHueSpread: -1 }).warning);
+	assert.ok(parseConfig({ sessionHueSpread: 361 }).warning);
+	assert.ok(parseConfig({ sessionHueSpread: "wide" }).warning);
 });
 
 test("shouldActivate honors explicit true/false and auto-detects iTerm2 via TERM_PROGRAM", () => {

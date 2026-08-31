@@ -50,6 +50,7 @@ Defaults apply with no configuration file. Override in:
 - `tabTitle` — prefix a status icon on the tab title (see [How the tab title is chosen](#how-the-tab-title-is-chosen)).
 - `currentDir` — emit iTerm2's native `CurrentDir`/`RemoteHost` sequences.
 - `userVars` — publish `pi_cwd`, `pi_session`, and `pi_status` as iTerm2 user-defined variables.
+- `palette`, `hostColors`, `sessionHueSpread` — shape or override the automatic colors (see [Choosing your own colors](#choosing-your-own-colors)).
 
 ### SSH and `enabled: "auto"`
 
@@ -64,6 +65,24 @@ Color is HSL, composed from three factors in priority order:
 1. **Host** sets the hue (`os.hostname()`, hashed) — the dominant, most visible difference between tabs on different machines.
 2. **Session id** nudges that hue by up to ±20° — sessions on the same host land in the same color family but stay distinguishable.
 3. **Status** sets saturation/lightness only, never hue: dim while idle, brighter while the agent is working, brightest when a dialog needs your input, and desaturated-but-marked when the most recently completed turn ended in a tool error (cleared as soon as a later turn succeeds, so a self-corrected run ends up looking normal, not stuck red).
+
+### Choosing your own colors
+
+By default every hue is hashed, so you get whatever the wheel gives you. Three options change that, from loosest to tightest:
+
+```json
+{
+  "palette": ["#4a7ba7", "#a74a5c", "#4aa76b", 45],
+  "hostColors": { "devbox": "#7a4aa7", "laptop": 200 },
+  "sessionHueSpread": 0
+}
+```
+
+- **`palette`** — hosts are assigned from these colors instead of the full 0–360° wheel, so everything stays in a set you picked while still being automatic for new machines.
+- **`hostColors`** — pins named hosts explicitly. Wins over `palette`, and any host not listed still falls back to `palette`, then to the hash.
+- **`sessionHueSpread`** — degrees of per-session nudge around the host hue (default `40`, i.e. ±20°). Set it to `0` to pin every session on a host to exactly that hue — worth doing if you pin colors and want precisely the color you named.
+
+Colors are accepted either as `"#rrggbb"` or as a bare hue number (`0`–`359`). **Only the hue is used** from a hex color: saturation and lightness stay reserved for conveying status, so a pinned host still visibly brightens while the agent works. If you want the exact literal color instead, that trade-off isn't available — status signalling is the reason the tab is colored at all.
 
 The tab color and user variables reset on session shutdown.
 

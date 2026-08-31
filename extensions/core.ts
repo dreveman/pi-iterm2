@@ -11,16 +11,24 @@ export function hashString(value: string): number {
 	return hash >>> 0;
 }
 
-const SESSION_HUE_SPREAD = 40; // session hue offset ranges over [-20, 20)
+export const DEFAULT_SESSION_HUE_SPREAD = 40; // session hue offset ranges over [-spread/2, spread/2)
 
-/** Hue bucket for a host. Dominant factor in tab color so different machines are visually distinct. */
-export function hostHue(host: string): number {
+/**
+ * Hue bucket for a host, the dominant factor in tab color. An explicit pin for this host
+ * wins; otherwise a palette, when configured, constrains the choice to those hues instead
+ * of the whole wheel; otherwise the hash spreads over the full 0-360 range.
+ */
+export function hostHue(host: string, palette: number[] = [], hostHues: Record<string, number> = {}): number {
+	const pinned = hostHues[host];
+	if (pinned !== undefined) return pinned;
+	if (palette.length > 0) return palette[hashString(`host:${host}`) % palette.length]!;
 	return hashString(`host:${host}`) % 360;
 }
 
-/** Small hue nudge for a session, layered on top of the host hue. */
-export function sessionHueOffset(sessionId: string): number {
-	return (hashString(`session:${sessionId}`) % SESSION_HUE_SPREAD) - SESSION_HUE_SPREAD / 2;
+/** Small hue nudge for a session, layered on top of the host hue. A spread of 0 disables it. */
+export function sessionHueOffset(sessionId: string, spread: number = DEFAULT_SESSION_HUE_SPREAD): number {
+	if (spread <= 0) return 0;
+	return (hashString(`session:${sessionId}`) % spread) - spread / 2;
 }
 
 export type AgentStatus = "idle" | "working" | "waiting" | "error";
@@ -92,9 +100,42 @@ export function hslToRgb(h: number, s: number, l: number): Rgb {
 	};
 }
 
+/** Hue of an RGB color, in degrees [0,360). Grey has no meaningful hue, so it maps to 0. */
+export function rgbToHue({ r, g, b }: Rgb): number {
+	const rN = r / 255;
+	const gN = g / 255;
+	const bN = b / 255;
+	const max = Math.max(rN, gN, bN);
+	const delta = max - Math.min(rN, gN, bN);
+	if (delta === 0) return 0;
+	let hue: number;
+	if (max === rN) hue = ((gN - bN) / delta) % 6;
+	else if (max === gN) hue = (bN - rN) / delta + 2;
+	else hue = (rN - gN) / delta + 4;
+	return ((hue * 60) % 360 + 360) % 360;
+}
+
+/**
+ * A configured color, given either as a hue in degrees or as a `#rrggbb` string. Only the
+ * hue is taken from a hex color on purpose: saturation and lightness stay reserved for
+ * conveying agent status, which is the point of the tab color in the first place.
+ */
+export function parseColorSpec(value: unknown): number | undefined {
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) return undefined;
+		return ((value % 360) + 360) % 360;
+	}
+	if (typeof value !== "string") return undefined;
+	const match = /^#?([0-9a-fA-F]{6})$/.exec(value.trim());
+	if (!match) return undefined;
+	const int = Number.parseInt(match[1]!, 16);
+	return rgbToHue({ r: (int >> 16) & 0xff, g: (int >> 8) & 0xff, b: int & 0xff });
+}
+
 /** Combine host, session, and status into one tab color: host sets hue, session nudges it, status sets brightness. */
-export function computeTabColorRgb(host: string, sessionId: string, status: AgentStatus): Rgb {
-	const hue = (hostHue(host) + sessionHueOffset(sessionId) + 360) % 360;
+export function computeTabColorRgb(config: PiIterm2Config, host: string, sessionId: string, status: AgentStatus): Rgb {
+	const hue =
+		(hostHue(host, config.palette, config.hostColors) + sessionHueOffset(sessionId, config.sessionHueSpread) + 360) % 360;
 	const style = STATUS_STYLE[status];
 	return hslToRgb(hue, style.saturation, style.lightness);
 }
@@ -173,15 +214,31 @@ export interface PiIterm2Config {
 	tabTitle: boolean;
 	currentDir: boolean;
 	userVars: boolean;
+	/** Hues hosts are assigned from. Empty means the full 0-360 wheel. */
+	palette: number[];
+	/** Hostname -> hue, pinning specific machines regardless of hash or palette. */
+	hostColors: Record<string, number>;
+	/** Degrees of per-session hue nudge around the host hue; 0 pins every session to it exactly. */
+	sessionHueSpread: number;
 }
 
-export const DEFAULT_CONFIG: PiIterm2Config = {
-	enabled: "auto",
-	tabColor: true,
-	tabTitle: true,
-	currentDir: true,
-	userVars: true,
-};
+/** A fresh config every call: `palette` and `hostColors` are nested, so a shared constant
+ *  would hand every caller the same array/object to mutate. */
+export function defaultConfig(): PiIterm2Config {
+	return {
+		enabled: "auto",
+		tabColor: true,
+		tabTitle: true,
+		currentDir: true,
+		userVars: true,
+		palette: [],
+		hostColors: {},
+		sessionHueSpread: DEFAULT_SESSION_HUE_SPREAD,
+	};
+}
+
+/** Convenience snapshot of the defaults; use defaultConfig() when a mutable copy is needed. */
+export const DEFAULT_CONFIG: PiIterm2Config = defaultConfig();
 
 export interface ConfigResult {
 	config: PiIterm2Config;
@@ -194,37 +251,66 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const BOOLEAN_FIELDS = ["tabColor", "tabTitle", "currentDir", "userVars"] as const;
 
-export function parseConfig(value: unknown): ConfigResult {
-	// A fresh copy, never the shared DEFAULT_CONFIG reference, so a caller mutating a
-	// returned config can't corrupt the defaults for the rest of the process.
-	const fallback = { config: { ...DEFAULT_CONFIG } };
-	if (!isRecord(value)) return { ...fallback, warning: "configuration must be a JSON object" };
+const COLOR_HINT = "a hue 0-359 or a \"#rrggbb\" color";
 
-	const knownKeys = new Set<string>(["enabled", ...BOOLEAN_FIELDS]);
+export function parseConfig(value: unknown): ConfigResult {
+	// A fresh config, never the shared DEFAULT_CONFIG, so a caller mutating a returned
+	// config (or its nested palette/hostColors) can't corrupt the defaults process-wide.
+	const fail = (warning: string): ConfigResult => ({ config: defaultConfig(), warning });
+	if (!isRecord(value)) return fail("configuration must be a JSON object");
+
+	const knownKeys = new Set<string>(["enabled", ...BOOLEAN_FIELDS, "palette", "hostColors", "sessionHueSpread"]);
 	const unknownKeys = Object.keys(value).filter((key) => !knownKeys.has(key));
 	if (unknownKeys.length > 0) {
-		return { ...fallback, warning: `unknown configuration field${unknownKeys.length === 1 ? "" : "s"}: ${unknownKeys.join(", ")}` };
+		return fail(`unknown configuration field${unknownKeys.length === 1 ? "" : "s"}: ${unknownKeys.join(", ")}`);
 	}
 
 	if (value.enabled !== undefined && value.enabled !== "auto" && typeof value.enabled !== "boolean") {
-		return { ...fallback, warning: `enabled must be true, false, or "auto"` };
+		return fail(`enabled must be true, false, or "auto"`);
 	}
 
 	for (const field of BOOLEAN_FIELDS) {
 		if (value[field] !== undefined && typeof value[field] !== "boolean") {
-			return { ...fallback, warning: `${field} must be a boolean` };
+			return fail(`${field} must be a boolean`);
 		}
 	}
 
-	return {
-		config: {
-			enabled: (value.enabled as EnabledSetting | undefined) ?? DEFAULT_CONFIG.enabled,
-			tabColor: (value.tabColor as boolean | undefined) ?? DEFAULT_CONFIG.tabColor,
-			tabTitle: (value.tabTitle as boolean | undefined) ?? DEFAULT_CONFIG.tabTitle,
-			currentDir: (value.currentDir as boolean | undefined) ?? DEFAULT_CONFIG.currentDir,
-			userVars: (value.userVars as boolean | undefined) ?? DEFAULT_CONFIG.userVars,
-		},
-	};
+	const config = defaultConfig();
+
+	if (value.palette !== undefined) {
+		if (!Array.isArray(value.palette)) return fail("palette must be an array of colors");
+		if (value.palette.length === 0) return fail("palette must not be empty; omit it to use the full hue range");
+		const hues: number[] = [];
+		for (const entry of value.palette) {
+			const hue = parseColorSpec(entry);
+			if (hue === undefined) return fail(`palette entry ${JSON.stringify(entry)} must be ${COLOR_HINT}`);
+			hues.push(hue);
+		}
+		config.palette = hues;
+	}
+
+	if (value.hostColors !== undefined) {
+		if (!isRecord(value.hostColors)) return fail("hostColors must be an object mapping hostname to a color");
+		for (const [host, entry] of Object.entries(value.hostColors)) {
+			const hue = parseColorSpec(entry);
+			if (hue === undefined) return fail(`hostColors["${host}"] must be ${COLOR_HINT}`);
+			config.hostColors[host] = hue;
+		}
+	}
+
+	if (value.sessionHueSpread !== undefined) {
+		const spread = value.sessionHueSpread;
+		if (typeof spread !== "number" || !Number.isFinite(spread) || spread < 0 || spread > 360) {
+			return fail("sessionHueSpread must be a number between 0 and 360");
+		}
+		config.sessionHueSpread = spread;
+	}
+
+	config.enabled = (value.enabled as EnabledSetting | undefined) ?? config.enabled;
+	for (const field of BOOLEAN_FIELDS) {
+		config[field] = (value[field] as boolean | undefined) ?? config[field];
+	}
+	return { config };
 }
 
 export function parseConfigText(text: string): ConfigResult {
@@ -232,7 +318,7 @@ export function parseConfigText(text: string): ConfigResult {
 		return parseConfig(JSON.parse(text) as unknown);
 	} catch (error) {
 		return {
-			config: { ...DEFAULT_CONFIG },
+			config: defaultConfig(),
 			warning: `invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
 		};
 	}
@@ -259,7 +345,7 @@ export interface SessionIdentity {
  */
 export function buildStatusSequences(config: PiIterm2Config, identity: Pick<SessionIdentity, "host">, sessionId: string, status: AgentStatus): string {
 	let out = "";
-	if (config.tabColor) out += buildTabColorSequence(computeTabColorRgb(identity.host, sessionId, status));
+	if (config.tabColor) out += buildTabColorSequence(computeTabColorRgb(config, identity.host, sessionId, status));
 	if (config.userVars) out += buildSetUserVarSequence("pi_status", status);
 	return out;
 }
