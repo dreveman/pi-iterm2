@@ -163,9 +163,9 @@ In `~/.bashrc`:
 
 ```bash
 if [[ $- == *i* ]]; then
-	PI_ITERM2_TAB_COLOR=$(python3 ~/path/to/pi-iterm2/shell/tab_color.py 2>/dev/null)
-	pi_iterm2_tab_color() { printf %s "$PI_ITERM2_TAB_COLOR"; }
-	[[ $PROMPT_COMMAND == *pi_iterm2_tab_color* ]] || PROMPT_COMMAND="pi_iterm2_tab_color${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+  PI_ITERM2_TAB_COLOR=$(python3 ~/path/to/pi-iterm2/shell/tab_color.py 2>/dev/null)
+  pi_iterm2_tab_color() { printf %s "$PI_ITERM2_TAB_COLOR"; }
+  [[ $PROMPT_COMMAND == *pi_iterm2_tab_color* ]] || PROMPT_COMMAND="pi_iterm2_tab_color${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
 fi
 ```
 
@@ -175,9 +175,9 @@ Same idea in `~/.zshrc`, but zsh has no `PROMPT_COMMAND` — use a `precmd` hook
 
 ```zsh
 if [[ -o interactive ]]; then
-	PI_ITERM2_TAB_COLOR=$(python3 ~/path/to/pi-iterm2/shell/tab_color.py 2>/dev/null)
-	pi_iterm2_tab_color() { printf %s "$PI_ITERM2_TAB_COLOR" }
-	(( ${precmd_functions[(Ie)pi_iterm2_tab_color]} )) || precmd_functions+=(pi_iterm2_tab_color)
+  PI_ITERM2_TAB_COLOR=$(python3 ~/path/to/pi-iterm2/shell/tab_color.py 2>/dev/null)
+  pi_iterm2_tab_color() { printf %s "$PI_ITERM2_TAB_COLOR" }
+  (( ${precmd_functions[(Ie)pi_iterm2_tab_color]} )) || precmd_functions+=(pi_iterm2_tab_color)
 fi
 ```
 
