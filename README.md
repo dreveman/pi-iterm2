@@ -1,6 +1,14 @@
 # pi-iterm2
 
-A [Pi coding agent](https://pi.dev/) extension that ties iTerm2 tabs to the session running in them:
+**Never lose a Pi session after an iTerm2 or system restart.** The macOS companion daemon remembers the remote host, working directory, and Pi session ID for every tab. When iTerm2 restores a tab, it prints exactly what was running there:
+
+```text
+pi-iterm2: last session in this tab was 01abc... (idle) on devvm123 /home/me/project, 2m ago
+```
+
+That tells you which host to reconnect to, which working directory to enter, and which exact Pi session to resume. Recovery is independent of SSH, mosh, devserver tooling, or any other connection method because pi-iterm2 records the session identity in the tab itself rather than managing the connection.
+
+The extension also ties iTerm2 tabs to the live Pi sessions running in them:
 
 - **Tab color** is derived from hostname (primary), session id (secondary nudge), and live agent status (idle/working/waiting/error) — so tabs on different machines are visually distinct, sessions on the same machine stay in the same color family, and a glance at the tab tells you whether that session needs attention.
 - **Tab title** gets a status icon prefixed while there's something to flag (working/waiting/error), on top of pi's own default title.
@@ -208,7 +216,7 @@ Note that none of badge/title/status-bar text is mouse-selectable (it's UI chrom
 
 ## macOS companion daemon
 
-`macos/pi_iterm2_daemon.py` is a standalone script that runs on the Mac, separately from the pi extension — it is not required for the tab color/user var/`CurrentDir` features above, which work without it. It records each tab's `pi_cwd`/`pi_session`/`pi_status` into `~/.pi-iterm2/state.json` (keyed by iTerm2 session id, capped at the 200 most recent), so that a tab which comes back after iTerm2 or the remote host restarts can be told what was last running in it.
+`macos/pi_iterm2_daemon.py` is a standalone script that runs on the Mac, separately from the pi extension — it is not required for the tab color/user var/`CurrentDir` features above, which work without it. It records each tab's host, `pi_cwd`, `pi_session`, and `pi_status` into `~/.pi-iterm2/state.json` (keyed by iTerm2 session id, capped at the 200 most recent), so that a tab restored after iTerm2, the local system, or the remote host restarts can say exactly where and how to resume its previous Pi session.
 
 The reminder is injected **when the tab appears and no pi session is live in it** — i.e. while it's still showing a plain shell prompt — and deliberately not when pi later starts. `async_inject` delivers data as though it were program output, so injecting into a running pi TUI would land in a screen pi is actively repainting and be overwritten or corrupt it; a tab that already has a live pi session is skipped for the same reason.
 
