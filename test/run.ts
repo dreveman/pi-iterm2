@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	buildCurrentDirSequence,
@@ -30,6 +34,11 @@ import {
 	WORKING_ICON_FRAMES,
 	wrapForTmux,
 } from "../extensions/core.ts";
+import {
+	DAEMON_PROTOCOL_VERSION,
+	normalizeItermSessionId,
+	requestDaemonReport,
+} from "../extensions/daemon-client.ts";
 
 let passed = 0;
 function test(name: string, fn: () => void): void {
@@ -319,6 +328,52 @@ test("wrapForTmux wraps in a DCS envelope and doubles inner ESC bytes inside tmu
 	assert.equal(wrapped.endsWith("\x1b\\"), true);
 });
 
-console.log(`${passed} tests passed`);
+test("normalizeItermSessionId accepts both iTerm's prefixed value and a bare guid", () => {
+	assert.equal(normalizeItermSessionId("w3t0p0:ABC-123"), "ABC-123");
+	assert.equal(normalizeItermSessionId("ABC-123"), "ABC-123");
+	assert.equal(normalizeItermSessionId(undefined), undefined);
+});
 
-export default function (_pi: ExtensionAPI): void {}
+async function testDaemonClient(): Promise<void> {
+	const directory = mkdtempSync(join(tmpdir(), "pi-iterm2-test-"));
+	const socketPath = join(directory, "daemon.sock");
+	const server = createServer((socket) => {
+		let request = "";
+		socket.on("data", (chunk) => {
+			request += chunk.toString("utf8");
+			if (!request.includes("\n")) return;
+			assert.deepEqual(JSON.parse(request.trim()), {
+				version: DAEMON_PROTOCOL_VERSION,
+				command: "check",
+				sessionId: "ABC-123",
+			});
+			const response = `${JSON.stringify({ version: DAEMON_PROTOCOL_VERSION, ok: true, output: "report" })}\n`;
+			// Deliberately split the response to exercise stream framing.
+			socket.write(response.slice(0, 5));
+			socket.end(response.slice(5));
+		});
+	});
+
+	try {
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(socketPath, resolve);
+		});
+		assert.equal(
+			await requestDaemonReport("check", "w3t0p0:ABC-123", { socketPath, timeoutMs: 1_000 }),
+			"report",
+		);
+		passed++;
+		console.log("ok - daemon client sends a normalized request and reads a chunked response");
+	} finally {
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+		rmSync(directory, { recursive: true, force: true });
+	}
+}
+
+console.log(`${passed} synchronous tests passed`);
+
+export default async function (_pi: ExtensionAPI): Promise<void> {
+	await testDaemonClient();
+	console.log(`${passed} tests passed`);
+}

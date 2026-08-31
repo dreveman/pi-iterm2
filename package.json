@@ -21,6 +21,7 @@
   "files": [
     "extensions/*.ts",
     "test/*.ts",
+    "test/*.py",
     "macos/*.py",
     "tsconfig.json",
     "README.md",
@@ -29,7 +30,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "smoke": "pi --no-extensions --offline -e . --list-models",
-    "test": "pi --no-extensions --offline -e ./test/run.ts --list-models",
+    "test": "python3 test/daemon_test.py && pi --no-extensions --offline -e ./test/run.ts --list-models",
     "verify": "npm run check && npm test && npm run smoke"
   },
   "pi": {

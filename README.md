@@ -158,10 +158,12 @@ The reminder is injected **when the tab appears and no pi session is live in it*
 Three commands, only registered when pi is running on macOS:
 
 - `/iterm2-daemon-install` — copies the bundled daemon to `~/Library/Application Support/iTerm2/Scripts/AutoLaunch/pi_iterm2_daemon.py`. Safe to run again to pick up an update; it just overwrites.
-- `/iterm2-daemon-check` — runs the installed daemon's `--check` against the tab you're in and shows the result: current live variables, what's stored, and exactly what would be printed if this tab were restored right now. Read-only.
-- `/iterm2-daemon-check-all` — the same report for every live session, plus a count of stored records whose tabs no longer exist.
+- `/iterm2-daemon-check` — asks the running daemon for a report about the tab you're in: current live variables, what's stored, and exactly what would be printed if this tab were restored right now. Read-only.
+- `/iterm2-daemon-check-all` — asks for the same report for every live session, plus a count of stored records whose tabs no longer exist.
 
-After `/iterm2-daemon-install` (and the prerequisites above), restart iTerm2 for it to start running.
+The check commands use the running AutoLaunch daemon's already-authenticated iTerm2 connection through a user-only local socket at `~/.pi-iterm2/daemon.sock`. They do not start a second Python API client, because iTerm2's one-time authentication can reject programs launched as captured child processes (including Pi extension commands) even when the same command works in an ordinary shell.
+
+After `/iterm2-daemon-install` (and the prerequisites above), restart iTerm2 for it to start running. Reinstall and restart after upgrading from a daemon version that does not yet provide the local check socket.
 
 ### Otherwise
 

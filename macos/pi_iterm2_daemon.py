@@ -12,6 +12,11 @@ Python environment this runs under (with the `iterm2` module included);
 enabling the API alone does not. iTerm2 runs AutoLaunch scripts
 automatically on startup once both are done.
 
+While running, serves the Pi extension's read-only check commands over a
+user-only Unix socket at ~/.pi-iterm2/daemon.sock. This reuses the daemon's
+already-authenticated iTerm2 connection instead of opening another connection
+from a captured child process, where iTerm2's one-time authentication can fail.
+
 Records, per tab: the `user.pi_cwd` / `user.pi_session` / `user.pi_status`
 variables the pi-iterm2 pi extension publishes (plus `hostname` when it is
 available), into ~/.pi-iterm2/state.json, keyed by the iTerm2 session id
@@ -52,6 +57,8 @@ Usage:
 """
 
 import argparse
+import asyncio
+import fcntl
 import json
 import os
 import sys
@@ -62,6 +69,10 @@ from typing import Optional
 import iterm2
 
 STATE_PATH = Path.home() / ".pi-iterm2" / "state.json"
+SOCKET_PATH = STATE_PATH.parent / "daemon.sock"
+LOCK_PATH = STATE_PATH.parent / "daemon.lock"
+PROTOCOL_VERSION = 1
+MAX_REQUEST_BYTES = 16 * 1024
 
 # Keep the most recently updated records only, so a long-lived install does not
 # accumulate one entry per tab ever opened.
@@ -185,58 +196,41 @@ async def track_session(connection, session_id):
             record_session(session_id, values)
 
 
-async def daemon_main(connection):
-    app = await iterm2.async_get_app(connection)
-
-    async def on_session(session_id):
-        try:
-            await track_session(connection, session_id)
-        except Exception:
-            pass  # RPC failed for this session; stop watching it
-
-    # Covers every session that exists now, plus every one created later. The framework
-    # cancels each task when its session terminates.
-    await iterm2.EachSessionOnceMonitor.async_foreach_session_create_task(
-        app, on_session
-    )
+def resolve_session_id(value: Optional[str]) -> Optional[str]:
+    # iTerm2 sets this in every session's shell environment as "w0t0p0:<guid>".
+    return value.rsplit(":", 1)[-1] if value else None
 
 
-def resolve_session_id(explicit: Optional[str]) -> Optional[str]:
-    if explicit:
-        return explicit
-    # iTerm2 sets this in every session's shell environment, as "w0t0p0:<guid>".
-    env_value = os.environ.get("ITERM_SESSION_ID", "")
-    return env_value.rsplit(":", 1)[-1] if env_value else None
-
-
-def print_session_report(
+def format_session_report(
     session_id: str, values: dict, prior: Optional[dict], marker: str = ""
-) -> None:
+) -> str:
     """One session's live variables, stored record, and what would be injected. Shared by
-    --check and --check-all so the two can never drift apart."""
-    print(f"session id: {session_id}{marker}")
-    print(f"hostname:   {values['hostname'] or '(unset)'}")
-    print(f"cwd:        {values['cwd'] or '(unset)'}")
-    print(f"pi_session: {values['pi_session'] or '(unset)'}")
-    print(f"pi_status:  {values['pi_status'] or '(unset)'}")
-    print()
-    print("stored record:", json.dumps(prior, indent=2) if prior else "(none)")
-    print()
+    --check, --check-all, and local IPC so the three can never drift apart."""
+    lines = [
+        f"session id: {session_id}{marker}",
+        f"hostname:   {values['hostname'] or '(unset)'}",
+        f"cwd:        {values['cwd'] or '(unset)'}",
+        f"pi_session: {values['pi_session'] or '(unset)'}",
+        f"pi_status:  {values['pi_status'] or '(unset)'}",
+        "",
+        "stored record: " + (json.dumps(prior, indent=2) if prior else "(none)"),
+        "",
+    ]
 
     line = build_reminder_line(prior)
     if not line:
-        print("Would inject on restore: nothing (no record stored for this tab yet)")
-        return
-    print("Would inject on restore:")
-    print(line.strip("\r\n"))
+        lines.append("Would inject on restore: nothing (no record stored for this tab yet)")
+        return "\n".join(lines)
+    lines.extend(["Would inject on restore:", line.strip("\r\n")])
     if values["pi_session"]:
-        print()
-        print(
-            "Note: suppressed while pi is live in this tab. The reminder is injected only"
+        lines.extend(
+            [
+                "",
+                "Note: suppressed while pi is live in this tab. The reminder is injected only",
+                "when a tab appears with no pi session running, so it cannot land in pi's TUI.",
+            ]
         )
-        print(
-            "when a tab appears with no pi session running, so it cannot land in pi's TUI."
-        )
+    return "\n".join(lines)
 
 
 def format_session_line(
@@ -266,37 +260,45 @@ def all_sessions(app) -> list:
     return sessions
 
 
-async def check_main(connection, session_id: Optional[str]):
+async def build_check_report(connection, session_id: Optional[str]) -> str:
     app = await iterm2.async_get_app(connection)
     resolved_id = resolve_session_id(session_id)
     if not resolved_id:
-        print(
-            "No session id given and ITERM_SESSION_ID is not set. Run this from inside",
-            file=sys.stderr,
+        raise ValueError(
+            "No session id given and ITERM_SESSION_ID is not set. Run this from inside "
+            "an iTerm2 tab, or pass --session <id>, or use --check-all."
         )
-        print(
-            "an iTerm2 tab, or pass --session <id>, or use --check-all.",
-            file=sys.stderr,
-        )
-        return
 
     session = app.get_session_by_id(resolved_id)
     if session is None:
-        print(f"No live session with id {resolved_id}.", file=sys.stderr)
-        return
+        raise ValueError(f"No live session with id {resolved_id}.")
 
     values = await read_session_vars(session)
-    print_session_report(resolved_id, values, load_state().get(resolved_id))
+    return format_session_report(
+        resolved_id, values, load_state().get(resolved_id)
+    )
 
 
-async def check_all_main(connection):
+async def check_main(connection, session_id: Optional[str]):
+    try:
+        print(
+            await build_check_report(
+                connection, session_id or os.environ.get("ITERM_SESSION_ID")
+            )
+        )
+    except ValueError as error:
+        print(error, file=sys.stderr)
+
+
+async def build_check_all_report(
+    connection, current_session_id: Optional[str] = None
+) -> str:
     app = await iterm2.async_get_app(connection)
     sessions = all_sessions(app)
     if not sessions:
-        print("No live iTerm2 sessions.")
-        return
+        return "No live iTerm2 sessions."
 
-    current_id = resolve_session_id(None)
+    current_id = resolve_session_id(current_session_id)
     state = load_state()
 
     recorded, unrecorded = [], []
@@ -309,28 +311,167 @@ async def check_all_main(connection):
         )
         (recorded if state.get(session_id) else unrecorded).append(entry)
 
+    lines = []
     if recorded:
-        print(f"Tabs with a stored record ({len(recorded)}):\n")
+        lines.append(f"Tabs with a stored record ({len(recorded)}):\n")
         for index, (session_id, values, marker) in enumerate(recorded):
             if index:
-                print("\n" + "-" * 72 + "\n")
-            print_session_report(session_id, values, state.get(session_id), marker)
-        print()
+                lines.append("\n" + "-" * 72 + "\n")
+            lines.append(
+                format_session_report(
+                    session_id, values, state.get(session_id), marker
+                )
+            )
+        lines.append("")
 
     if unrecorded:
-        print(f"Tabs with no stored record ({len(unrecorded)}):")
+        lines.append(f"Tabs with no stored record ({len(unrecorded)}):")
         width = max(
             len(f"{session_id}{marker}") for session_id, _, marker in unrecorded
         )
         for session_id, values, marker in unrecorded:
-            print(format_session_line(session_id, values, marker, width))
-        print()
+            lines.append(format_session_line(session_id, values, marker, width))
+        lines.append("")
 
     orphans = [key for key in state if key not in {s.session_id for s in sessions}]
-    print("=" * 72)
-    print(
-        f"{len(sessions)} live session(s); {len(state)} stored record(s), {len(orphans)} for tabs that no longer exist."
+    lines.extend(
+        [
+            "=" * 72,
+            f"{len(sessions)} live session(s); {len(state)} stored record(s), {len(orphans)} for tabs that no longer exist.",
+        ]
     )
+    return "\n".join(lines)
+
+
+async def check_all_main(connection):
+    print(await build_check_all_report(connection, os.environ.get("ITERM_SESSION_ID")))
+
+
+async def handle_control_request(reader, writer, connection, report_lock) -> None:
+    """Serve one bounded, read-only request over the user-owned local socket."""
+    response = {"version": PROTOCOL_VERSION, "ok": False}
+    try:
+        line = await asyncio.wait_for(reader.readline(), timeout=5)
+        if not line or len(line) > MAX_REQUEST_BYTES or not line.endswith(b"\n"):
+            raise ValueError("Invalid or oversized daemon request.")
+        request = json.loads(line)
+        if not isinstance(request, dict):
+            raise ValueError("Daemon request must be a JSON object.")
+        version = request.get("version")
+        if not isinstance(version, int) or isinstance(version, bool) or version != PROTOCOL_VERSION:
+            raise ValueError("Incompatible daemon protocol version.")
+        command = request.get("command")
+        session_id = request.get("sessionId")
+        if session_id is not None and not isinstance(session_id, str):
+            raise ValueError("sessionId must be a string.")
+
+        async def run_report():
+            async with report_lock:
+                if command == "check":
+                    return await build_check_report(connection, session_id)
+                if command == "check-all":
+                    return await build_check_all_report(connection, session_id)
+                raise ValueError("Unknown daemon command.")
+
+        # Include time waiting behind another report in the deadline, and leave a
+        # margin before the extension client's 15-second timeout.
+        output = await asyncio.wait_for(run_report(), timeout=14)
+        response = {"version": PROTOCOL_VERSION, "ok": True, "output": output}
+    except asyncio.TimeoutError:
+        response["error"] = "Timed out while handling daemon request."
+    except (ValueError, json.JSONDecodeError) as error:
+        response["error"] = str(error) or "Invalid daemon request."
+    except Exception as error:
+        response["error"] = f"Could not query iTerm2: {error}"
+
+    try:
+        writer.write((json.dumps(response) + "\n").encode("utf-8"))
+        await writer.drain()
+    except (BrokenPipeError, ConnectionError):
+        pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (BrokenPipeError, ConnectionError):
+            pass
+
+
+def prepare_state_directory() -> None:
+    STATE_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STATE_PATH.parent, 0o700)
+
+
+def acquire_daemon_lock(timeout: float = 5):
+    """Hold an advisory lock, allowing an old daemon time to exit on app restart."""
+    prepare_state_directory()
+    lock_file = open(LOCK_PATH, "a+")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock_file
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                lock_file.close()
+                return None
+            time.sleep(0.1)
+
+
+async def start_control_server(connection, report_lock):
+    """Create the IPC socket. The caller must already hold the daemon lock."""
+    try:
+        SOCKET_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+    async def on_client(reader, writer):
+        await handle_control_request(reader, writer, connection, report_lock)
+
+    server = await asyncio.start_unix_server(
+        on_client,
+        path=SOCKET_PATH,
+        limit=MAX_REQUEST_BYTES + 1,
+    )
+    os.chmod(SOCKET_PATH, 0o600)
+    stat = SOCKET_PATH.stat()
+    return server, (stat.st_dev, stat.st_ino)
+
+
+async def daemon_main(connection):
+    app = await iterm2.async_get_app(connection)
+    report_lock = asyncio.Lock()
+    try:
+        control = await start_control_server(connection, report_lock)
+    except Exception as error:
+        # Reporting is optional. A filesystem/socket problem must not disable the
+        # daemon's primary record-and-replay behavior.
+        print(f"Could not start pi-iterm2 check socket: {error}", file=sys.stderr)
+        control = None
+
+    async def on_session(session_id):
+        try:
+            await track_session(connection, session_id)
+        except Exception:
+            pass  # RPC failed for this session; stop watching it
+
+    try:
+        # Covers every session that exists now, plus every one created later. The
+        # framework cancels each task when its session terminates.
+        await iterm2.EachSessionOnceMonitor.async_foreach_session_create_task(
+            app, on_session
+        )
+    finally:
+        if control:
+            server, socket_identity = control
+            server.close()
+            await server.wait_closed()
+            try:
+                stat = SOCKET_PATH.stat()
+                if (stat.st_dev, stat.st_ino) == socket_identity:
+                    SOCKET_PATH.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def main() -> None:
@@ -359,6 +500,10 @@ def main() -> None:
             lambda connection: check_main(connection, args.session)
         )
     else:
+        daemon_lock = acquire_daemon_lock()
+        if daemon_lock is None:
+            print("Another pi-iterm2 daemon is already running.", file=sys.stderr)
+            return
         iterm2.run_forever(daemon_main)
 
 

@@ -1,10 +1,8 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { execFile } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, hostname, userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 import {
 	buildIdentitySequences,
 	buildResetSequences,
@@ -22,17 +20,16 @@ import {
 	type SessionIdentity,
 	type StatusState,
 } from "./core.ts";
+import { requestDaemonReport, type DaemonCommand } from "./daemon-client.ts";
 
 const WORKING_ICON_INTERVAL_MS = 1000;
 
 const CONFIG_PATH = join(getAgentDir(), "pi-iterm2.json");
 
-const execFileAsync = promisify(execFile);
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const DAEMON_SOURCE_PATH = join(PACKAGE_ROOT, "macos", "pi_iterm2_daemon.py");
 const AUTOLAUNCH_DIR = join(homedir(), "Library", "Application Support", "iTerm2", "Scripts", "AutoLaunch");
 const DAEMON_INSTALL_PATH = join(AUTOLAUNCH_DIR, "pi_iterm2_daemon.py");
-const ITERM2_PYTHON_VERSIONS_DIR = join(homedir(), "Library", "Application Support", "iTerm2", "iterm2env", "versions");
 
 function hasErrorCode(error: unknown, code: string): boolean {
 	return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
@@ -89,31 +86,6 @@ function currentUser(): string {
 	}
 }
 
-// iTerm2 can leave more than one entry under versions/ (e.g. a stale one alongside a
-// freshly (re)installed runtime), so pick whichever candidate actually has a python3
-// binary and was modified most recently, rather than an arbitrary readdirSync() order.
-function findIterm2Python(): string | undefined {
-	let versions: string[];
-	try {
-		versions = readdirSync(ITERM2_PYTHON_VERSIONS_DIR);
-	} catch {
-		return undefined;
-	}
-
-	let newest: { path: string; mtimeMs: number } | undefined;
-	for (const version of versions) {
-		const candidate = join(ITERM2_PYTHON_VERSIONS_DIR, version, "bin", "python3");
-		let mtimeMs: number;
-		try {
-			mtimeMs = statSync(candidate).mtimeMs;
-		} catch {
-			continue;
-		}
-		if (!newest || mtimeMs > newest.mtimeMs) newest = { path: candidate, mtimeMs };
-	}
-	return newest?.path;
-}
-
 export default function (pi: ExtensionAPI) {
 	const loadedConfig = loadConfig();
 	const config = loadedConfig.config;
@@ -147,7 +119,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	const runDaemonCheck = async (ctx: ExtensionContext, flag: "--check" | "--check-all") => {
+	const runDaemonCheck = async (ctx: ExtensionContext, command: DaemonCommand) => {
 		if (process.platform !== "darwin") {
 			ctx.ui.notify("The companion daemon only runs on macOS.", "error");
 			return;
@@ -156,30 +128,31 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("Daemon isn't installed yet. Run /iterm2-daemon-install first.", "error");
 			return;
 		}
-		const python = findIterm2Python();
-		if (!python) {
-			ctx.ui.notify("Could not find iTerm2's bundled Python. Run Scripts -> Install Python Runtime in iTerm2 first.", "error");
-			return;
-		}
 		try {
-			const { stdout, stderr } = await execFileAsync(python, [DAEMON_INSTALL_PATH, flag], { timeout: 15_000 });
-			ctx.ui.notify((stdout || stderr || "(no output)").trim(), "info");
+			const output = await requestDaemonReport(command, process.env.ITERM_SESSION_ID);
+			ctx.ui.notify(output.trim() || "(no output)", "info");
 		} catch (error) {
-			ctx.ui.notify(
-				`Check failed (if this is the first run, approve iTerm2's connection prompt and try again): ${error instanceof Error ? error.message : String(error)}`,
-				"error",
-			);
+			const code =
+				typeof error === "object" && error !== null && "code" in error
+					? String((error as { code?: unknown }).code)
+					: undefined;
+			const detail = error instanceof Error ? error.message : String(error);
+			const hint =
+				code === "ENOENT" || code === "ECONNREFUSED"
+					? "The installed daemon is not running (or predates local check support). Run /iterm2-daemon-install, then restart iTerm2."
+					: detail;
+			ctx.ui.notify(`Check failed: ${hint}`, "error");
 		}
 	};
 
 	pi.registerCommand("iterm2-daemon-check", {
 		description: "Preview what the pi-iterm2 macOS daemon would print if this tab were restored right now",
-		handler: async (_args, ctx) => runDaemonCheck(ctx, "--check"),
+		handler: async (_args, ctx) => runDaemonCheck(ctx, "check"),
 	});
 
 	pi.registerCommand("iterm2-daemon-check-all", {
 		description: "Preview the pi-iterm2 macOS daemon's record for every live iTerm2 session",
-		handler: async (_args, ctx) => runDaemonCheck(ctx, "--check-all"),
+		handler: async (_args, ctx) => runDaemonCheck(ctx, "check-all"),
 	});
 
 	if (!active) return;
