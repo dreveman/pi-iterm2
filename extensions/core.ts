@@ -121,15 +121,21 @@ export function rgbToHue({ r, g, b }: Rgb): number {
  * conveying agent status, which is the point of the tab color in the first place.
  */
 export function parseColorSpec(value: unknown): number | undefined {
-	if (typeof value === "number") {
-		if (!Number.isFinite(value)) return undefined;
-		return ((value % 360) + 360) % 360;
-	}
+	const wrap = (hue: number) => ((hue % 360) + 360) % 360;
+	if (typeof value === "number") return Number.isFinite(value) ? wrap(value) : undefined;
 	if (typeof value !== "string") return undefined;
-	const match = /^#?([0-9a-fA-F]{6})$/.exec(value.trim());
-	if (!match) return undefined;
-	const int = Number.parseInt(match[1]!, 16);
-	return rgbToHue({ r: (int >> 16) & 0xff, g: (int >> 8) & 0xff, b: int & 0xff });
+	const text = value.trim();
+
+	// Hex is matched before a plain number so a bare six-digit string stays a colour
+	// ("123456" is #123456, not hue 123456). Everything arriving from a slash command is a
+	// string, so a hue typed as text has to parse here too, not just as a JSON number.
+	const hex = /^#?([0-9a-fA-F]{6})$/.exec(text);
+	if (hex) {
+		const int = Number.parseInt(hex[1]!, 16);
+		return rgbToHue({ r: (int >> 16) & 0xff, g: (int >> 8) & 0xff, b: int & 0xff });
+	}
+	if (/^[+-]?\d+(\.\d+)?$/.test(text)) return wrap(Number(text));
+	return undefined;
 }
 
 /** Combine host, session, and status into one tab color: host sets hue, session nudges it, status sets brightness. */

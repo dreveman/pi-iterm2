@@ -224,6 +224,12 @@ test("parseColorSpec accepts hues and #rrggbb, and rejects junk", () => {
 	assert.equal(parseColorSpec("00ff00"), 120); // leading # optional
 	assert.equal(parseColorSpec("#0000FF"), 240);
 	assert.equal(parseColorSpec("#808080"), 0); // grey has no hue
+	// Slash-command args arrive as strings, so a hue typed as text must parse as a hue...
+	assert.equal(parseColorSpec("120"), 120);
+	assert.equal(parseColorSpec(" 400 "), 40);
+	assert.equal(parseColorSpec("-30"), 330);
+	// ...but a bare six-digit string stays a hex colour, not a huge hue.
+	assert.equal(parseColorSpec("123456"), rgbToHue({ r: 0x12, g: 0x34, b: 0x56 }));
 	for (const junk of ["red", "#fff", "#gggggg", "", null, undefined, {}, true]) {
 		assert.equal(parseColorSpec(junk), undefined, `should reject ${JSON.stringify(junk)}`);
 	}

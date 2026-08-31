@@ -1,6 +1,6 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname, userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,8 @@ import {
 	buildStatusSequences,
 	buildTabTitle,
 	deriveStatus,
+	hostHue,
+	parseColorSpec,
 	parseConfigText,
 	shouldActivate,
 	statusIcon,
@@ -46,6 +48,36 @@ function loadConfig(): ConfigResult {
 			warning: `Could not read ${CONFIG_PATH}: ${error instanceof Error ? error.message : String(error)}; using defaults`,
 		};
 	}
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Read-modify-write of the user's config file, preserving every field this extension
+ * doesn't touch. Returns an error message, or undefined on success. Deliberately refuses
+ * to overwrite a file it can't parse, rather than silently discarding what's in it.
+ */
+function updateConfigFile(mutate: (raw: Record<string, unknown>) => void): string | undefined {
+	let raw: Record<string, unknown> = {};
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+		if (!isPlainObject(parsed)) return `${CONFIG_PATH} is not a JSON object; fix it by hand first`;
+		raw = parsed;
+	} catch (error) {
+		if (!hasErrorCode(error, "ENOENT")) {
+			return `Could not read ${CONFIG_PATH}: ${error instanceof Error ? error.message : String(error)}`;
+		}
+	}
+	mutate(raw);
+	try {
+		mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+		writeFileSync(CONFIG_PATH, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+	} catch (error) {
+		return `Could not write ${CONFIG_PATH}: ${error instanceof Error ? error.message : String(error)}`;
+	}
+	return undefined;
 }
 
 function currentUser(): string {
@@ -273,5 +305,97 @@ export default function (pi: ExtensionAPI) {
 		// Drop the status icon too, so a session killed mid-turn doesn't strand a spinner
 		// frame in the title of a dead tab.
 		if (config.tabTitle) ctx.ui.setTitle(buildTabTitle("", sessionDisplayName, basename(identity.cwd)));
+	});
+
+	// Picking a colour is a look-at-it task, so these apply to the live tab immediately and
+	// persist to the config file, rather than making you edit JSON and /reload to see it.
+	// The typed spec is stored verbatim ("#4a7ba7" stays "#4a7ba7"), not the derived hue.
+	const spreadHint = () =>
+		config.sessionHueSpread > 0
+			? ` Sessions are still nudged ±${config.sessionHueSpread / 2}°; set sessionHueSpread to 0 for exactly this hue.`
+			: "";
+
+	pi.registerCommand("iterm2-color", {
+		description: "Show, set, or clear this host's pinned tab colour (e.g. /iterm2-color #4a7ba7)",
+		handler: async (args, ctx) => {
+			const arg = args.trim();
+			const pinned = config.hostColors[host];
+			if (!arg) {
+				ctx.ui.notify(
+					pinned === undefined
+						? `${host} has no pinned colour (hue ${Math.round(hostHue(host, config.palette, config.hostColors))}° from ${config.palette.length ? "palette" : "hash"}). Set one with /iterm2-color <#rrggbb|hue>.`
+						: `${host} is pinned to hue ${Math.round(pinned)}°. Clear it with /iterm2-color clear.`,
+					"info",
+				);
+				return;
+			}
+			if (arg === "clear" || arg === "none") {
+				delete config.hostColors[host];
+				const error = updateConfigFile((raw) => {
+					if (isPlainObject(raw.hostColors)) delete raw.hostColors[host];
+				});
+				if (error) return ctx.ui.notify(error, "error");
+				pushStatus(ctx);
+				ctx.ui.notify(`Cleared the pinned colour for ${host}.`, "info");
+				return;
+			}
+			const hue = parseColorSpec(arg);
+			if (hue === undefined) {
+				ctx.ui.notify(`"${arg}" is not a hue 0-359 or a #rrggbb colour.`, "error");
+				return;
+			}
+			config.hostColors[host] = hue;
+			const error = updateConfigFile((raw) => {
+				const existing = isPlainObject(raw.hostColors) ? raw.hostColors : {};
+				existing[host] = /^\d+$/.test(arg) ? Number(arg) : arg;
+				raw.hostColors = existing;
+			});
+			if (error) return ctx.ui.notify(error, "error");
+			pushStatus(ctx);
+			ctx.ui.notify(`${host} pinned to ${arg} (hue ${Math.round(hue)}°).${spreadHint()}`, "info");
+		},
+	});
+
+	pi.registerCommand("iterm2-palette", {
+		description: "Show, set, or clear the palette hosts are coloured from (e.g. /iterm2-palette #4a7ba7 #a74a5c)",
+		handler: async (args, ctx) => {
+			const parts = args.trim().split(/\s+/).filter(Boolean);
+			if (parts.length === 0) {
+				ctx.ui.notify(
+					config.palette.length === 0
+						? "No palette set; host hues come from the full 0-360° wheel. Set one with /iterm2-palette <colour> <colour> ..."
+						: `Palette: ${config.palette.map((hue) => `${Math.round(hue)}°`).join(", ")}. Clear it with /iterm2-palette clear.`,
+					"info",
+				);
+				return;
+			}
+			if (parts.length === 1 && (parts[0] === "clear" || parts[0] === "none")) {
+				config.palette = [];
+				const error = updateConfigFile((raw) => {
+					delete raw.palette;
+				});
+				if (error) return ctx.ui.notify(error, "error");
+				pushStatus(ctx);
+				ctx.ui.notify("Cleared the palette; host hues use the full wheel again.", "info");
+				return;
+			}
+			const hues: number[] = [];
+			for (const part of parts) {
+				const hue = parseColorSpec(part);
+				if (hue === undefined) {
+					ctx.ui.notify(`"${part}" is not a hue 0-359 or a #rrggbb colour.`, "error");
+					return;
+				}
+				hues.push(hue);
+			}
+			config.palette = hues;
+			const error = updateConfigFile((raw) => {
+				raw.palette = parts.map((part) => (/^\d+$/.test(part) ? Number(part) : part));
+			});
+			if (error) return ctx.ui.notify(error, "error");
+			pushStatus(ctx);
+			const pinnedNote = config.hostColors[host] === undefined ? "" : ` (${host} stays pinned; /iterm2-color clear to unpin)`;
+			ctx.ui.notify(`Palette set to ${parts.length} colour(s)${pinnedNote}.${spreadHint()}`, "info");
+		},
 	});
 }

@@ -84,6 +84,20 @@ By default every hue is hashed, so you get whatever the wheel gives you. Three o
 
 Colors are accepted either as `"#rrggbb"` or as a bare hue number (`0`–`359`). **Only the hue is used** from a hex color: saturation and lightness stay reserved for conveying status, so a pinned host still visibly brightens while the agent works. If you want the exact literal color instead, that trade-off isn't available — status signalling is the reason the tab is colored at all.
 
+Rather than editing JSON and reloading to see the result, two commands change the live tab immediately and save the result to the same config file:
+
+```
+/iterm2-color                          show this host's current colour and where it came from
+/iterm2-color #4a7ba7                  pin this host (also accepts a bare hue, e.g. 208)
+/iterm2-color clear                    unpin it
+
+/iterm2-palette                        show the current palette
+/iterm2-palette #4a7ba7 #a74a5c 45     set it
+/iterm2-palette clear                  back to the full hue wheel
+```
+
+They rewrite `~/.pi/agent/pi-iterm2.json` in place, preserving any other settings in it, and store what you typed (`#4a7ba7` stays `#4a7ba7`) rather than the derived hue. `sessionHueSpread` has no command — it's a set-once preference, so edit the file for that.
+
 The tab color and user variables reset on session shutdown.
 
 ## How the tab title is chosen
