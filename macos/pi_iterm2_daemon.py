@@ -140,10 +140,7 @@ def colored_hostname(host, color, dim_context=False) -> str:
         return host
     red, green, blue = (int(channel, 16) for channel in match.groups())
     if dim_context:
-        return (
-            f"\x1b[22;38;2;{red};{green};{blue}m{host}"
-            f"\x1b[2;39m"
-        )
+        return f"\x1b[22;38;2;{red};{green};{blue}m{host}" f"\x1b[2;39m"
     return f"\x1b[38;2;{red};{green};{blue}m{host}\x1b[39m"
 
 
@@ -246,7 +243,9 @@ def format_session_report(
 
     line = build_reminder_line(prior)
     if not line:
-        lines.append("Would inject on restore: nothing (no record stored for this tab yet)")
+        lines.append(
+            "Would inject on restore: nothing (no record stored for this tab yet)"
+        )
         return "\n".join(lines)
     lines.extend(["Would inject on restore:", line.strip("\r\n")])
     if values["pi_session"]:
@@ -306,9 +305,7 @@ async def build_check_report(connection, session_id: Optional[str]) -> str:
         raise ValueError(f"No live session with id {resolved_id}.")
 
     values = await read_session_vars(session)
-    return format_session_report(
-        resolved_id, values, load_state().get(resolved_id)
-    )
+    return format_session_report(resolved_id, values, load_state().get(resolved_id))
 
 
 async def check_main(connection, session_id: Optional[str]):
@@ -350,9 +347,7 @@ async def build_check_all_report(
             if index:
                 lines.append("\n" + "-" * 72 + "\n")
             lines.append(
-                format_session_report(
-                    session_id, values, state.get(session_id), marker
-                )
+                format_session_report(session_id, values, state.get(session_id), marker)
             )
         lines.append("")
 
@@ -390,7 +385,11 @@ async def handle_control_request(reader, writer, connection, report_lock) -> Non
         if not isinstance(request, dict):
             raise ValueError("Daemon request must be a JSON object.")
         version = request.get("version")
-        if not isinstance(version, int) or isinstance(version, bool) or version != PROTOCOL_VERSION:
+        if (
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or version != PROTOCOL_VERSION
+        ):
             raise ValueError("Incompatible daemon protocol version.")
         command = request.get("command")
         session_id = request.get("sessionId")

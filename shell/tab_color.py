@@ -125,8 +125,7 @@ def hsl_to_rgb(hue, saturation, lightness):
     # Python round() uses ties-to-even; JavaScript Math.round() rounds positive
     # half-values up. RGB channels are nonnegative, so floor(x + 0.5) matches it.
     return tuple(
-        math.floor((channel + base) * 255 + 0.5)
-        for channel in (red, green, blue)
+        math.floor((channel + base) * 255 + 0.5) for channel in (red, green, blue)
     )
 
 
