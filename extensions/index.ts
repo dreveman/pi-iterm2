@@ -316,6 +316,32 @@ export default function (pi: ExtensionAPI) {
 			? ` Sessions are still nudged ±${config.sessionHueSpread / 2}°; set sessionHueSpread to 0 for exactly this hue.`
 			: "";
 
+	/**
+	 * A swatch plus the value behind it. The hue is always shown since that's the canonical
+	 * stored form; the original spec is shown alongside when it was written as a hex, so
+	 * "#4a7ba7" doesn't decay into a bare "208°" the moment you look at it again.
+	 */
+	const describeColor = (hue: number, spec?: unknown): string => {
+		const degrees = `${Math.round(hue)}°`;
+		// Only a hex spec adds information; a spec that is already a number would just
+		// render as "120 (120°)", and reads differently depending on whether it came back
+		// from JSON as a number or from a command as a string.
+		const hex = typeof spec === "string" && !/^[+-]?\d+(\.\d+)?$/.test(spec.trim()) ? spec.trim() : undefined;
+		return hex ? `${hueSwatch(hue)} ${hex} (${degrees})` : `${hueSwatch(hue)} ${degrees}`;
+	};
+
+	/** The config file as written, for recovering the specs the user actually typed. */
+	const readRawConfig = (): Record<string, unknown> => {
+		try {
+			const parsed: unknown = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+			return isPlainObject(parsed) ? parsed : {};
+		} catch {
+			return {};
+		}
+	};
+
+	const storedSpecs = (key: "palette" | "hostColors"): unknown => readRawConfig()[key];
+
 	pi.registerCommand("iterm2-color", {
 		description: "Show, set, or clear this host's pinned tab color (e.g. /iterm2-color #4a7ba7)",
 		handler: async (args, ctx) => {
@@ -324,8 +350,8 @@ export default function (pi: ExtensionAPI) {
 			if (!arg) {
 				ctx.ui.notify(
 					pinned === undefined
-						? `${host} ${hueSwatch(hostHue(host, config.palette, config.hostColors))} hue ${Math.round(hostHue(host, config.palette, config.hostColors))}° (from ${config.palette.length ? "palette" : "hash"}, not pinned). Set one with /iterm2-color <#rrggbb|hue>.`
-						: `${host} ${hueSwatch(pinned)} pinned to hue ${Math.round(pinned)}°. Clear it with /iterm2-color clear.`,
+						? `${host} ${describeColor(hostHue(host, config.palette, config.hostColors))} from ${config.palette.length ? "palette" : "hash"}, not pinned. Set one with /iterm2-color <#rrggbb|hue>.`
+						: `${host} pinned to ${describeColor(pinned, (storedSpecs("hostColors") as Record<string, unknown> | undefined)?.[host])}. Clear it with /iterm2-color clear.`,
 					"info",
 				);
 				return;
@@ -353,7 +379,7 @@ export default function (pi: ExtensionAPI) {
 			});
 			if (error) return ctx.ui.notify(error, "error");
 			pushStatus(ctx);
-			ctx.ui.notify(`${host} ${hueSwatch(hue)} pinned to ${arg} (hue ${Math.round(hue)}°).${spreadHint()}`, "info");
+			ctx.ui.notify(`${host} pinned to ${describeColor(hue, arg)}.${spreadHint()}`, "info");
 		},
 	});
 
@@ -365,7 +391,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(
 					config.palette.length === 0
 						? "No palette set; host hues come from the full 0-360° wheel. Set one with /iterm2-palette <color> <color> ..."
-						: `Palette: ${config.palette.map((hue) => `${hueSwatch(hue)} ${Math.round(hue)}°`).join("  ")}. Clear it with /iterm2-palette clear.`,
+						: `Palette: ${config.palette.map((hue, index) => describeColor(hue, (storedSpecs("palette") as unknown[] | undefined)?.[index])).join("  ")}. Clear it with /iterm2-palette clear.`,
 					"info",
 				);
 				return;
@@ -396,7 +422,7 @@ export default function (pi: ExtensionAPI) {
 			if (error) return ctx.ui.notify(error, "error");
 			pushStatus(ctx);
 			const pinnedNote = config.hostColors[host] === undefined ? "" : ` (${host} stays pinned; /iterm2-color clear to unpin)`;
-			ctx.ui.notify(`Palette set: ${hues.map((hue) => `${hueSwatch(hue)} ${Math.round(hue)}°`).join("  ")}${pinnedNote}.${spreadHint()}`, "info");
+			ctx.ui.notify(`Palette set: ${hues.map((hue, index) => describeColor(hue, parts[index])).join("  ")}${pinnedNote}.${spreadHint()}`, "info");
 		},
 	});
 }
