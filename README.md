@@ -146,6 +146,47 @@ To ignore VS Code entirely, set `"vscodeColor": false` in `~/.pi/agent/pi-iterm2
 
 Note that a fully grey window color (some "black"/"charcoal" presets) has no hue at all and resolves to 0°, i.e. red. Pin the host with `/iterm2-color` if you'd rather have something else.
 
+## Coloring tabs that aren't running pi
+
+The tab color is three ordinary escape sequences, so a plain shell prompt can set the same color pi would — useful when you keep shells open on several machines and only some of them are running pi. `shell/tab_color.py` prints the escape for the current host and nothing else:
+
+```bash
+python3 shell/tab_color.py            # print the escape sequence
+python3 shell/tab_color.py --check    # print what it resolved, and why
+```
+
+It reads the same `~/.pi/agent/pi-iterm2.json`, follows the same precedence (`hostColors` → VS Code window color → `palette` → hostname hash), uses the same hash and the same color math, and honors `enabled: false`, `tabColor: false` and `vscodeColor: false` — so one configuration covers both, and a shell tab and a pi tab on the same host are the exact same color. It only ever reads; it has no dependencies beyond the standard library, so it also works copied to a host on its own.
+
+### bash
+
+In `~/.bashrc`:
+
+```bash
+if [[ $- == *i* ]]; then
+	PI_ITERM2_TAB_COLOR=$(python3 ~/path/to/pi-iterm2/shell/tab_color.py 2>/dev/null)
+	pi_iterm2_tab_color() { printf %s "$PI_ITERM2_TAB_COLOR"; }
+	[[ $PROMPT_COMMAND == *pi_iterm2_tab_color* ]] || PROMPT_COMMAND="pi_iterm2_tab_color${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+fi
+```
+
+### zsh
+
+Same idea in `~/.zshrc`, but zsh has no `PROMPT_COMMAND` — use a `precmd` hook:
+
+```zsh
+if [[ -o interactive ]]; then
+	PI_ITERM2_TAB_COLOR=$(python3 ~/path/to/pi-iterm2/shell/tab_color.py 2>/dev/null)
+	pi_iterm2_tab_color() { printf %s "$PI_ITERM2_TAB_COLOR" }
+	(( ${precmd_functions[(Ie)pi_iterm2_tab_color]} )) || precmd_functions+=(pi_iterm2_tab_color)
+fi
+```
+
+Both run the script **once per shell** and replay the captured escape from a prompt hook, so the per-prompt cost is a shell builtin rather than a Python start-up. Both are also safe to re-source: the guard keeps the hook from being registered twice.
+
+The prompt hook matters for more than the first prompt: pi resets the tab color to the profile default when a session ends, so re-emitting on each prompt is what restores the host color after you exit pi.
+
+Two limits worth knowing. A shell has no agent status, so this always emits the resting (idle) shade — the working/waiting/error brightness only happens while pi is running. And since `TERM_PROGRAM` isn't forwarded over SSH, the script can't detect iTerm2 and simply emits unconditionally; other terminals ignore these sequences, but if you also connect from a terminal where that isn't true, guard the snippet with a check of your own.
+
 ## tmux
 
 Sequences are wrapped in tmux's DCS passthrough envelope (`ESC Ptmux; ... ESC \`) whenever `$TMUX` is set, so tab color and user vars work inside a tmux session running in iTerm2. This does not require `allow-passthrough` to be configured in tmux.
