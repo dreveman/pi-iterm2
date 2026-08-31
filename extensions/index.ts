@@ -13,6 +13,7 @@ import {
 	hueSwatch,
 	parseColorSpec,
 	parseConfigText,
+	vsCodeHueFromSettings,
 	shouldActivate,
 	statusIcon,
 	wrapForTmux,
@@ -30,6 +31,36 @@ const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const DAEMON_SOURCE_PATH = join(PACKAGE_ROOT, "macos", "pi_iterm2_daemon.py");
 const AUTOLAUNCH_DIR = join(homedir(), "Library", "Application Support", "iTerm2", "Scripts", "AutoLaunch");
 const DAEMON_INSTALL_PATH = join(AUTOLAUNCH_DIR, "pi_iterm2_daemon.py");
+
+/**
+ * VS Code's machine-scope settings, where a per-machine window color lives. Machine scope
+ * is the right one: it describes the host, which is exactly what the tab hue conveys, and
+ * unlike user or workspace scope it doesn't travel between machines. Both remote server
+ * layouts are checked because the directory name differs by VS Code flavor.
+ */
+const VSCODE_SETTINGS_PATHS = [
+	join(homedir(), ".vscode-remote", "data", "Machine", "settings.json"),
+	join(homedir(), ".vscode-server", "data", "Machine", "settings.json"),
+];
+
+/**
+ * Hue of the VS Code window color for this machine, or undefined when there isn't one.
+ * Every failure -- no VS Code, no file, no color set, unreadable file -- is the same silent
+ * undefined, since having no VS Code color is the normal case and the caller has a fallback.
+ */
+function readVsCodeHue(): number | undefined {
+	for (const path of VSCODE_SETTINGS_PATHS) {
+		let text: string;
+		try {
+			text = readFileSync(path, "utf8");
+		} catch {
+			continue;
+		}
+		const hue = vsCodeHueFromSettings(text);
+		if (hue !== undefined) return hue;
+	}
+	return undefined;
+}
 
 function hasErrorCode(error: unknown, code: string): boolean {
 	return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
@@ -165,6 +196,9 @@ export default function (pi: ExtensionAPI) {
 	let identity: SessionIdentity = { cwd: "", sessionName: "", user, host };
 	let workingFrame = 0;
 	let workingTimer: NodeJS.Timeout | undefined;
+	// Read once per session rather than watched: the color is a property of the machine, so it
+	// effectively never changes mid-session. /iterm2-color refresh re-reads it on demand.
+	let vscodeHue = config.vscodeColor ? readVsCodeHue() : undefined;
 
 	const stopWorkingTimer = () => {
 		if (!workingTimer) return;
@@ -207,7 +241,7 @@ export default function (pi: ExtensionAPI) {
 
 	/** Everything that reflects live status: tab color, the pi_status user var, and the title. */
 	const pushStatus = (ctx: ExtensionContext) => {
-		write(ctx, buildStatusSequences(config, identity, sessionId, deriveStatus(status)));
+		write(ctx, buildStatusSequences(config, identity, sessionId, deriveStatus(status), vscodeHue));
 		pushTitle(ctx);
 	};
 
@@ -315,6 +349,12 @@ export default function (pi: ExtensionAPI) {
 
 	const storedSpecs = (key: "palette" | "hostColors"): unknown => readRawConfig()[key];
 
+	/** Where the host's hue is coming from right now, for the no-argument report. */
+	const hueSource = (): string => {
+		if (vscodeHue !== undefined) return "the VS Code window color";
+		return config.palette.length ? "palette" : "hash";
+	};
+
 	pi.registerCommand("iterm2-color", {
 		description: "Show, set, or clear this host's pinned tab color (e.g. /iterm2-color #4a7ba7)",
 		handler: async (args, ctx) => {
@@ -323,8 +363,25 @@ export default function (pi: ExtensionAPI) {
 			if (!arg) {
 				ctx.ui.notify(
 					pinned === undefined
-						? `${host} ${describeColor(hostHue(host, config.palette, config.hostColors))} from ${config.palette.length ? "palette" : "hash"}, not pinned. Set one with /iterm2-color <#rrggbb|hue>.`
-						: `${host} pinned to ${describeColor(pinned, (storedSpecs("hostColors") as Record<string, unknown> | undefined)?.[host])}. Clear it with /iterm2-color clear.`,
+						? `${host} ${describeColor(hostHue(host, config.palette, config.hostColors, vscodeHue))} from ${hueSource()}, not pinned. Set one with /iterm2-color <#rrggbb|hue>.`
+						: `${host} pinned to ${describeColor(pinned, (storedSpecs("hostColors") as Record<string, unknown> | undefined)?.[host])}, overriding ${hueSource()}. Clear it with /iterm2-color clear.`,
+					"info",
+				);
+				return;
+			}
+			// Re-reads the VS Code color, for the case where it was changed while this session
+			// was already running.
+			if (arg === "refresh") {
+				if (!config.vscodeColor) {
+					ctx.ui.notify('VS Code color reading is off; set "vscodeColor": true to enable it.', "error");
+					return;
+				}
+				vscodeHue = readVsCodeHue();
+				pushStatus(ctx);
+				ctx.ui.notify(
+					vscodeHue === undefined
+						? `No VS Code window color set for ${host}; using ${config.palette.length ? "the palette" : "the hash"}.`
+						: `VS Code window color for ${host} is now ${describeColor(vscodeHue)}${pinned === undefined ? "" : " (still overridden by the pinned color)"}.`,
 					"info",
 				);
 				return;
@@ -336,7 +393,7 @@ export default function (pi: ExtensionAPI) {
 				});
 				if (error) return ctx.ui.notify(error, "error");
 				pushStatus(ctx);
-				ctx.ui.notify(`Cleared the pinned color for ${host}.`, "info");
+				ctx.ui.notify(`Cleared the pinned color for ${host}; back to ${hueSource()}.`, "info");
 				return;
 			}
 			const hue = parseColorSpec(arg);
@@ -394,7 +451,14 @@ export default function (pi: ExtensionAPI) {
 			});
 			if (error) return ctx.ui.notify(error, "error");
 			pushStatus(ctx);
-			const pinnedNote = config.hostColors[host] === undefined ? "" : ` (${host} stays pinned; /iterm2-color clear to unpin)`;
+			// The palette only decides hues for hosts that aren't already colored some other way,
+			// so say so rather than leaving someone to wonder why this tab didn't change.
+			const pinnedNote =
+				config.hostColors[host] !== undefined
+					? ` (${host} stays pinned; /iterm2-color clear to unpin)`
+					: vscodeHue !== undefined
+						? ` (${host} keeps its VS Code window color; set "vscodeColor": false in ${CONFIG_PATH} to use the palette here)`
+						: "";
 			ctx.ui.notify(`Palette set: ${hues.map((hue, index) => describeColor(hue, parts[index])).join("  ")}${pinnedNote}.${spreadHint()}`, "info");
 		},
 	});

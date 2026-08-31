@@ -17,6 +17,7 @@ import {
 	colorSwatch,
 	computeTabColorRgb,
 	DEFAULT_CONFIG,
+	defaultConfig,
 	deriveStatus,
 	hashString,
 	hostHue,
@@ -33,12 +34,32 @@ import {
 	statusIcon,
 	WORKING_ICON_FRAMES,
 	wrapForTmux,
+	hueFromCssHex,
+	stripJsonComments,
+	vsCodeHueFromSettings,
+	VSCODE_COLOR_KEYS,
 } from "../extensions/core.ts";
 import {
 	DAEMON_PROTOCOL_VERSION,
 	normalizeItermSessionId,
 	requestDaemonReport,
 } from "../extensions/daemon-client.ts";
+
+/** A VS Code machine settings file as the tools that colorize a window actually write it. */
+function vscodeSettings(colors: Record<string, string> | undefined, extra: Record<string, unknown> = {}): string {
+	return JSON.stringify({ ...extra, ...(colors === undefined ? {} : { "workbench.colorCustomizations": colors }) }, null, 2);
+}
+
+/** The full block written for a preset, not just the one key, so the fallback order is exercised. */
+const PRESET_COLORS = {
+	"activityBar.background": "#1D4491",
+	"activityBar.foreground": "#FFFFFF",
+	"activityBar.inactiveForeground": "#CCCCCC",
+	"titleBar.activeBackground": "#2250A8",
+	"titleBar.activeForeground": "#CCCCCC",
+	"titleBar.inactiveBackground": "#2250A8",
+	"titleBar.inactiveForeground": "#CCCCCC",
+};
 
 let passed = 0;
 function test(name: string, fn: () => void): void {
@@ -332,6 +353,151 @@ test("normalizeItermSessionId accepts both iTerm's prefixed value and a bare gui
 	assert.equal(normalizeItermSessionId("w3t0p0:ABC-123"), "ABC-123");
 	assert.equal(normalizeItermSessionId("ABC-123"), "ABC-123");
 	assert.equal(normalizeItermSessionId(undefined), undefined);
+});
+test("hueFromCssHex accepts every hex form VS Code writes and ignores alpha", () => {
+	assert.equal(hueFromCssHex("#2250A8"), rgbToHue({ r: 0x22, g: 0x50, b: 0xa8 }));
+	// Shorthand doubles each digit, so #25a is #2255aa.
+	assert.equal(hueFromCssHex("#25a"), hueFromCssHex("#2255aa"));
+	// The 4th and 8th digits are alpha and must not change the hue.
+	assert.equal(hueFromCssHex("#25af"), hueFromCssHex("#2255aa"));
+	assert.equal(hueFromCssHex("#2250A866"), hueFromCssHex("#2250A8"));
+	assert.equal(hueFromCssHex(" #2250A8 "), hueFromCssHex("#2250A8"));
+	assert.equal(hueFromCssHex("#2250a8"), hueFromCssHex("#2250A8"));
+});
+
+test("hueFromCssHex requires a leading # so a bare hue keeps its meaning", () => {
+	// parseColorSpec must keep reading "123" as hue 123; that only holds if this parser,
+	// which supports 3-digit shorthand, never sees a value without the #.
+	assert.equal(hueFromCssHex("123"), undefined);
+	assert.equal(parseColorSpec("123"), 123);
+	assert.equal(hueFromCssHex("#12"), undefined);
+	assert.equal(hueFromCssHex("#123456789"), undefined);
+	assert.equal(hueFromCssHex("#nothex"), undefined);
+	assert.equal(hueFromCssHex(""), undefined);
+});
+
+test("a grey window color has no hue and lands on 0, per rgbToHue", () => {
+	// The charcoal presets are fully desaturated, so there is no hue to match. Documented
+	// rather than special-cased: rgbToHue maps grey to 0.
+	assert.equal(hueFromCssHex("#212121"), 0);
+	assert.equal(hueFromCssHex("#2A2A2A"), 0);
+});
+
+test("vsCodeHueFromSettings reads the title bar color out of a real settings file", () => {
+	const hue = vsCodeHueFromSettings(vscodeSettings(PRESET_COLORS));
+	assert.equal(hue, hueFromCssHex("#2250A8"));
+});
+
+test("vsCodeHueFromSettings ignores unrelated settings in the same file", () => {
+	const text = vscodeSettings(PRESET_COLORS, { "editor.fontSize": 13, "files.autoSave": "off" });
+	assert.equal(vsCodeHueFromSettings(text), hueFromCssHex("#2250A8"));
+});
+
+test("vsCodeHueFromSettings falls back through the color keys in order", () => {
+	assert.deepEqual(
+		[...VSCODE_COLOR_KEYS],
+		["titleBar.activeBackground", "titleBar.inactiveBackground", "activityBar.background"],
+	);
+	assert.equal(
+		vsCodeHueFromSettings(vscodeSettings({ "titleBar.inactiveBackground": "#2250A8" })),
+		hueFromCssHex("#2250A8"),
+	);
+	assert.equal(
+		vsCodeHueFromSettings(vscodeSettings({ "activityBar.background": "#1D4491" })),
+		hueFromCssHex("#1D4491"),
+	);
+	// A non-string or unparseable value is skipped rather than ending the search.
+	assert.equal(
+		vsCodeHueFromSettings(
+			JSON.stringify({
+				"workbench.colorCustomizations": { "titleBar.activeBackground": 42, "activityBar.background": "#1D4491" },
+			}),
+		),
+		hueFromCssHex("#1D4491"),
+	);
+});
+
+test("vsCodeHueFromSettings treats anything unusable as no color", () => {
+	// An empty object is how turning the color off is recorded.
+	assert.equal(vsCodeHueFromSettings(vscodeSettings({})), undefined);
+	assert.equal(vsCodeHueFromSettings(vscodeSettings(undefined)), undefined);
+	assert.equal(vsCodeHueFromSettings("{}"), undefined);
+	assert.equal(vsCodeHueFromSettings(""), undefined);
+	assert.equal(vsCodeHueFromSettings("not json at all {"), undefined);
+	assert.equal(vsCodeHueFromSettings("[1,2,3]"), undefined);
+	assert.equal(vsCodeHueFromSettings('{"workbench.colorCustomizations": "blue"}'), undefined);
+	assert.equal(vsCodeHueFromSettings(vscodeSettings({ "titleBar.activeBackground": "red" })), undefined);
+});
+
+test("stripJsonComments removes comments and trailing commas but not string contents", () => {
+	assert.equal(stripJsonComments('{"a": 1} // trailing'), '{"a": 1} ');
+	assert.equal(stripJsonComments('{"a": 1, /* mid */ "b": 2}'), '{"a": 1,  "b": 2}');
+	assert.equal(stripJsonComments('{"a": [1, 2,],}'), '{"a": [1, 2]}');
+	// A // or /* inside a string is data, not a comment.
+	assert.equal(stripJsonComments('{"url": "https://x/y"}'), '{"url": "https://x/y"}');
+	assert.equal(stripJsonComments('{"a": "/* not a comment */"}'), '{"a": "/* not a comment */"}');
+	// An escaped quote must not be read as the end of the string.
+	assert.equal(stripJsonComments('{"a": "x\\"//y"}'), '{"a": "x\\"//y"}');
+});
+
+test("vsCodeHueFromSettings parses a hand-edited JSONC file", () => {
+	const text = `{
+		// set by hand
+		"workbench.colorCustomizations": {
+			/* the blue one */
+			"titleBar.activeBackground": "#2250A8",
+		},
+	}`;
+	assert.equal(vsCodeHueFromSettings(text), hueFromCssHex("#2250A8"));
+});
+
+test("hostHue precedence: pin beats VS Code color beats palette beats hash", () => {
+	const palette = [10, 20, 30];
+	const external = 188;
+	assert.equal(hostHue("host-a", palette, { "host-a": 300 }, external), 300);
+	assert.equal(hostHue("host-a", palette, {}, external), external);
+	assert.ok(palette.includes(hostHue("host-a", palette, {}, undefined)));
+	const hashed = hostHue("host-a", [], {}, undefined);
+	assert.ok(hashed >= 0 && hashed < 360);
+	// A pin for a different host must not capture this one.
+	assert.equal(hostHue("host-a", [], { "host-b": 300 }, external), external);
+});
+
+test("the VS Code color reaches the tab color, and the pin still overrides it", () => {
+	const cfg = { ...defaultConfig(), sessionHueSpread: 0 };
+	const external = 188;
+	assert.deepEqual(
+		computeTabColorRgb(cfg, "host-a", "session-1", "idle", external),
+		tabColorForHue(external, "idle"),
+	);
+	const pinned = { ...cfg, hostColors: { "host-a": 300 } };
+	assert.deepEqual(
+		computeTabColorRgb(pinned, "host-a", "session-1", "idle", external),
+		tabColorForHue(300, "idle"),
+	);
+	// Omitting it leaves the previous behavior untouched.
+	assert.deepEqual(
+		computeTabColorRgb(cfg, "host-a", "session-1", "idle"),
+		computeTabColorRgb(cfg, "host-a", "session-1", "idle", undefined),
+	);
+});
+
+test("buildStatusSequences applies the VS Code hue to the tab color", () => {
+	const cfg = { ...defaultConfig(), sessionHueSpread: 0, userVars: false };
+	const external = 188;
+	assert.equal(
+		buildStatusSequences(cfg, { host: "host-a" }, "session-1", "idle", external),
+		buildTabColorSequence(tabColorForHue(external, "idle")),
+	);
+});
+
+test("vscodeColor is a boolean config field, on by default", () => {
+	assert.equal(defaultConfig().vscodeColor, true);
+	assert.equal(parseConfig({ vscodeColor: false }).config.vscodeColor, false);
+	assert.equal(parseConfig({ vscodeColor: false }).warning, undefined);
+	assert.match(String(parseConfig({ vscodeColor: "yes" }).warning), /vscodeColor must be a boolean/);
+	// Left at its default it stays out of the way of every other setting.
+	assert.equal(parseConfig({ palette: ["#8abeb7"] }).config.vscodeColor, true);
 });
 
 async function testDaemonClient(): Promise<void> {

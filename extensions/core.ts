@@ -15,12 +15,15 @@ export const DEFAULT_SESSION_HUE_SPREAD = 40; // session hue offset ranges over 
 
 /**
  * Hue bucket for a host, the dominant factor in tab color. An explicit pin for this host
- * wins; otherwise a palette, when configured, constrains the choice to those hues instead
- * of the whole wheel; otherwise the hash spreads over the full 0-360 range.
+ * wins; then a color this host already advertises elsewhere (see vsCodeHueFromSettings),
+ * so the tab agrees with whatever else is colored per-machine; otherwise a palette, when
+ * configured, constrains the choice to those hues instead of the whole wheel; otherwise the
+ * hash spreads over the full 0-360 range.
  */
-export function hostHue(host: string, palette: number[] = [], hostHues: Record<string, number> = {}): number {
+export function hostHue(host: string, palette: number[] = [], hostHues: Record<string, number> = {}, externalHue?: number): number {
 	const pinned = hostHues[host];
 	if (pinned !== undefined) return pinned;
+	if (externalHue !== undefined) return externalHue;
 	if (palette.length > 0) return palette[hashString(`host:${host}`) % palette.length]!;
 	return hashString(`host:${host}`) % 360;
 }
@@ -138,6 +141,146 @@ export function parseColorSpec(value: unknown): number | undefined {
 	return undefined;
 }
 
+/**
+ * Entries of VS Code's `workbench.colorCustomizations` that describe "the color of this
+ * window", most specific first. The title bar is the primary signal; the activity bar is a
+ * darker shade of the same color, so it only serves as a fallback for a settings file that
+ * colors it alone.
+ */
+export const VSCODE_COLOR_KEYS = [
+	"titleBar.activeBackground",
+	"titleBar.inactiveBackground",
+	"activityBar.background",
+] as const;
+
+/**
+ * Hue of a CSS hex color in any of the forms VS Code accepts: `#rgb`, `#rgba`, `#rrggbb`,
+ * `#rrggbbaa`. Alpha is discarded along with saturation and lightness, since only the hue
+ * is ever taken from an external color.
+ *
+ * The leading `#` is required, unlike parseColorSpec's optional one, so that shorthand can
+ * be supported here without changing what a bare number means there: "123" stays hue 123
+ * rather than becoming #112233.
+ */
+export function hueFromCssHex(value: string): number | undefined {
+	const digits = /^#([0-9a-fA-F]{3,8})$/.exec(value.trim())?.[1];
+	if (digits === undefined) return undefined;
+	// #rgb and #rgba are shorthand for doubled digits (#abc is #aabbcc); the 4th and 8th
+	// digits are alpha, which is dropped.
+	const sixDigits =
+		digits.length === 3 || digits.length === 4
+			? digits
+					.slice(0, 3)
+					.split("")
+					.map((digit) => digit + digit)
+					.join("")
+			: digits.length === 6 || digits.length === 8
+				? digits.slice(0, 6)
+				: undefined;
+	if (sixDigits === undefined) return undefined;
+	const int = Number.parseInt(sixDigits, 16);
+	return rgbToHue({ r: (int >> 16) & 0xff, g: (int >> 8) & 0xff, b: int & 0xff });
+}
+
+/**
+ * Strips `//` and block comments and trailing commas, so a hand-edited VS Code settings
+ * file still parses. VS Code reads its own settings as JSONC; tools that write the file
+ * emit strict JSON, but a human who has been in there may not have.
+ *
+ * Comment markers inside strings are left alone, which is what makes this worth a small
+ * scanner rather than a regex.
+ */
+export function stripJsonComments(text: string): string {
+	let out = "";
+	let inString = false;
+	let inLineComment = false;
+	let inBlockComment = false;
+	for (let i = 0; i < text.length; i++) {
+		const char = text[i]!;
+		const next = text[i + 1];
+		if (inLineComment) {
+			if (char === "\n") {
+				inLineComment = false;
+				out += char;
+			}
+			continue;
+		}
+		if (inBlockComment) {
+			if (char === "*" && next === "/") {
+				inBlockComment = false;
+				i++;
+			}
+			continue;
+		}
+		if (inString) {
+			out += char;
+			if (char === "\\") {
+				// Copy the escaped character verbatim so an escaped quote can't end the string.
+				if (next !== undefined) {
+					out += next;
+					i++;
+				}
+			} else if (char === '"') {
+				inString = false;
+			}
+			continue;
+		}
+		if (char === '"') {
+			inString = true;
+			out += char;
+			continue;
+		}
+		if (char === "/" && next === "/") {
+			inLineComment = true;
+			i++;
+			continue;
+		}
+		if (char === "/" && next === "*") {
+			inBlockComment = true;
+			i++;
+			continue;
+		}
+		out += char;
+	}
+	return out.replace(/,(\s*[}\]])/g, "$1");
+}
+
+/** JSON first, JSONC only as a fallback, so a strict file never pays for the scanner. */
+function parseJsonc(text: string): unknown {
+	try {
+		return JSON.parse(text) as unknown;
+	} catch {
+		try {
+			return JSON.parse(stripJsonComments(text)) as unknown;
+		} catch {
+			return undefined;
+		}
+	}
+}
+
+/**
+ * Hue of the window color recorded in one VS Code machine-scope settings file, or undefined
+ * when there is nothing usable there. Anything unexpected -- unparseable file, missing key,
+ * an empty `workbench.colorCustomizations` (which is how the color gets turned off), a
+ * value that isn't a hex color -- reads as "no color", because the caller's fallback is a
+ * perfectly good color and a terminal tab is no place to report someone else's broken JSON.
+ *
+ * Note that a fully grey color has no hue and so resolves to 0, i.e. red, per rgbToHue.
+ */
+export function vsCodeHueFromSettings(text: string): number | undefined {
+	const parsed = parseJsonc(text);
+	if (!isRecord(parsed)) return undefined;
+	const colors = parsed["workbench.colorCustomizations"];
+	if (!isRecord(colors)) return undefined;
+	for (const key of VSCODE_COLOR_KEYS) {
+		const value = colors[key];
+		if (typeof value !== "string") continue;
+		const hue = hueFromCssHex(value);
+		if (hue !== undefined) return hue;
+	}
+	return undefined;
+}
+
 /** The tab color a given hue produces at a given status, i.e. hue plus the status brightness. */
 export function tabColorForHue(hue: number, status: AgentStatus = "idle"): Rgb {
 	const style = STATUS_STYLE[status];
@@ -145,9 +288,18 @@ export function tabColorForHue(hue: number, status: AgentStatus = "idle"): Rgb {
 }
 
 /** Combine host, session, and status into one tab color: host sets hue, session nudges it, status sets brightness. */
-export function computeTabColorRgb(config: PiIterm2Config, host: string, sessionId: string, status: AgentStatus): Rgb {
+export function computeTabColorRgb(
+	config: PiIterm2Config,
+	host: string,
+	sessionId: string,
+	status: AgentStatus,
+	externalHue?: number,
+): Rgb {
 	const hue =
-		(hostHue(host, config.palette, config.hostColors) + sessionHueOffset(sessionId, config.sessionHueSpread) + 360) % 360;
+		(hostHue(host, config.palette, config.hostColors, externalHue) +
+			sessionHueOffset(sessionId, config.sessionHueSpread) +
+			360) %
+		360;
 	return tabColorForHue(hue, status);
 }
 
@@ -244,6 +396,8 @@ export interface PiIterm2Config {
 	palette: number[];
 	/** Hostname -> hue, pinning specific machines regardless of hash or palette. */
 	hostColors: Record<string, number>;
+	/** Take the host's hue from the VS Code window color, when one is set for this machine. */
+	vscodeColor: boolean;
 	/** Degrees of per-session hue nudge around the host hue; 0 pins every session to it exactly. */
 	sessionHueSpread: number;
 }
@@ -257,6 +411,7 @@ export function defaultConfig(): PiIterm2Config {
 		tabTitle: true,
 		currentDir: true,
 		userVars: true,
+		vscodeColor: true,
 		palette: [],
 		hostColors: {},
 		sessionHueSpread: DEFAULT_SESSION_HUE_SPREAD,
@@ -275,7 +430,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-const BOOLEAN_FIELDS = ["tabColor", "tabTitle", "currentDir", "userVars"] as const;
+const BOOLEAN_FIELDS = ["tabColor", "tabTitle", "currentDir", "userVars", "vscodeColor"] as const;
 
 const COLOR_HINT = "a hue 0-359 or a \"#rrggbb\" color";
 
@@ -369,9 +524,15 @@ export interface SessionIdentity {
  * the other. Returned as a single batched string: wrapForTmux then wraps the whole batch
  * once, per its contract, instead of once per inner OSC.
  */
-export function buildStatusSequences(config: PiIterm2Config, identity: Pick<SessionIdentity, "host">, sessionId: string, status: AgentStatus): string {
+export function buildStatusSequences(
+	config: PiIterm2Config,
+	identity: Pick<SessionIdentity, "host">,
+	sessionId: string,
+	status: AgentStatus,
+	externalHue?: number,
+): string {
 	let out = "";
-	if (config.tabColor) out += buildTabColorSequence(computeTabColorRgb(config, identity.host, sessionId, status));
+	if (config.tabColor) out += buildTabColorSequence(computeTabColorRgb(config, identity.host, sessionId, status, externalHue));
 	if (config.userVars) out += buildSetUserVarSequence("pi_status", status);
 	return out;
 }

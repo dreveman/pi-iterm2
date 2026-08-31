@@ -41,7 +41,8 @@ Defaults apply with no configuration file. Override in:
   "tabColor": true,
   "tabTitle": true,
   "currentDir": true,
-  "userVars": true
+  "userVars": true,
+  "vscodeColor": true
 }
 ```
 
@@ -50,6 +51,7 @@ Defaults apply with no configuration file. Override in:
 - `tabTitle` — prefix a status icon on the tab title (see [How the tab title is chosen](#how-the-tab-title-is-chosen)).
 - `currentDir` — emit iTerm2's native `CurrentDir`/`RemoteHost` sequences.
 - `userVars` — publish `pi_cwd`, `pi_session`, and `pi_status` as iTerm2 user-defined variables.
+- `vscodeColor` — take the host's hue from the VS Code window color when one is set for this machine (see [Matching the VS Code window color](#matching-the-vs-code-window-color)). Set it to `false` to ignore that and use the palette or hash instead.
 - `palette`, `hostColors`, `sessionHueSpread` — shape or override the automatic colors (see [Choosing your own colors](#choosing-your-own-colors)).
 
 ### SSH and `enabled: "auto"`
@@ -62,7 +64,7 @@ Missing configuration uses the defaults. Invalid JSON, unknown fields, and inval
 
 Color is HSL, composed from three factors in priority order:
 
-1. **Host** sets the hue (`os.hostname()`, hashed) — the dominant, most visible difference between tabs on different machines.
+1. **Host** sets the hue. In order: a `hostColors` pin for this machine, else the [VS Code window color](#matching-the-vs-code-window-color) if one is set for it, else a `palette` entry, else `os.hostname()` hashed over the full wheel — the dominant, most visible difference between tabs on different machines.
 2. **Session id** nudges that hue by up to ±20° — sessions on the same host land in the same color family but stay distinguishable.
 3. **Status** sets saturation/lightness only, never hue: dim while idle, brighter while the agent is working, brightest when a dialog needs your input, and desaturated-but-marked when the most recently completed turn ended in a tool error (cleared as soon as a later turn succeeds, so a self-corrected run ends up looking normal, not stuck red).
 
@@ -122,6 +124,27 @@ The title follows pi's own default format exactly: `π - session - cwd` once the
 It's set at the same status-change points as the tab color (`agent_start`, `agent_settled`, `ui_prompt_start`/`ui_prompt_end`, plus `/name`), not at session start — pi's own default title at that point is already identical to what this would produce for an idle session, so there's nothing to add there. Pi manages the tab title itself only at session start, rename, and shutdown, and never during a turn, so this never fights with pi's own title updates.
 
 The spin is a plain `setInterval` started at `agent_start` and stopped the moment status stops being "working" (settled, a dialog opens, session ends) — it never keeps ticking once idle.
+
+## Matching the VS Code window color
+
+If you color VS Code windows per machine — with [Peacock](https://marketplace.visualstudio.com/items?itemName=johnpapa.vscode-peacock), your platform's own tooling, or by hand — the tab picks up the same hue, so the terminal tab and the editor window agree without configuring anything twice.
+
+The color is read from VS Code's **machine-scope** settings, whichever of these exists:
+
+```text
+~/.vscode-remote/data/Machine/settings.json
+~/.vscode-server/data/Machine/settings.json
+```
+
+from `workbench.colorCustomizations`, taking the first of `titleBar.activeBackground`, `titleBar.inactiveBackground`, `activityBar.background` that holds a hex color. Machine scope is the one that describes the host: unlike user or workspace settings it doesn't follow you between machines, which is what makes it a sensible source for a per-host hue. Every hex form VS Code accepts works (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`); alpha is ignored, as are comments and trailing commas in the file.
+
+As everywhere else, **only the hue is taken** — saturation and lightness stay reserved for agent status, so a machine matched to its editor still brightens while working. A `hostColors` pin outranks this, and anything unusable (no file, no color set, an empty `workbench.colorCustomizations`, an unparseable file) falls back to the palette and then the hash, silently.
+
+The file is only ever read, never written, and only once per session — it describes the machine, so it effectively never changes mid-session. If you do change it while a session is open, `/iterm2-color refresh` re-reads it and recolors the tab.
+
+To ignore VS Code entirely, set `"vscodeColor": false` in `~/.pi/agent/pi-iterm2.json`.
+
+Note that a fully grey window color (some "black"/"charcoal" presets) has no hue at all and resolves to 0°, i.e. red. Pin the host with `/iterm2-color` if you'd rather have something else.
 
 ## tmux
 
