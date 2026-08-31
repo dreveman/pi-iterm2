@@ -140,7 +140,7 @@ def colored_hostname(host, color, dim_context=False) -> str:
         return host
     red, green, blue = (int(channel, 16) for channel in match.groups())
     if dim_context:
-        return f"\x1b[22;38;2;{red};{green};{blue}m{host}" f"\x1b[2;39m"
+        return f"\x1b[22;38;2;{red};{green};{blue}m{host}\x1b[2;39m"
     return f"\x1b[38;2;{red};{green};{blue}m{host}\x1b[39m"
 
 
