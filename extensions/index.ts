@@ -16,6 +16,7 @@ import {
 	vsCodeHueFromSettings,
 	shouldActivate,
 	statusIcon,
+	tabColorForHue,
 	wrapForTmux,
 	type ConfigResult,
 	type SessionIdentity,
@@ -245,9 +246,16 @@ export default function (pi: ExtensionAPI) {
 		pushTitle(ctx);
 	};
 
-	/** Session identity (cwd, name, host); only changes at session start and rename. */
+	/** Session identity, including the exact resting host color the local daemon records. */
 	const pushIdentity = (ctx: ExtensionContext) => {
-		write(ctx, buildIdentitySequences(config, identity));
+		const hue = hostHue(host, config.palette, config.hostColors, vscodeHue);
+		write(ctx, buildIdentitySequences(config, identity, tabColorForHue(hue, "idle")));
+	};
+
+	const pushColorChange = (ctx: ExtensionContext) => {
+		// Publish status and identity fields before pi_cwd triggers the daemon's snapshot.
+		pushStatus(ctx);
+		pushIdentity(ctx);
 	};
 
 	pi.on("session_start", (_event, ctx) => {
@@ -264,8 +272,9 @@ export default function (pi: ExtensionAPI) {
 			configWarning = undefined;
 		}
 
-		pushIdentity(ctx);
+		// pi_status and RemoteHost must be set before pi_cwd triggers the daemon's snapshot.
 		pushStatus(ctx);
+		pushIdentity(ctx);
 	});
 
 	pi.on("session_info_changed", (event, ctx) => {
@@ -377,7 +386,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				vscodeHue = readVsCodeHue();
-				pushStatus(ctx);
+				pushColorChange(ctx);
 				ctx.ui.notify(
 					vscodeHue === undefined
 						? `No VS Code window color set for ${host}; using ${config.palette.length ? "the palette" : "the hash"}.`
@@ -392,7 +401,7 @@ export default function (pi: ExtensionAPI) {
 					if (isPlainObject(raw.hostColors)) delete raw.hostColors[host];
 				});
 				if (error) return ctx.ui.notify(error, "error");
-				pushStatus(ctx);
+				pushColorChange(ctx);
 				ctx.ui.notify(`Cleared the pinned color for ${host}; back to ${hueSource()}.`, "info");
 				return;
 			}
@@ -408,7 +417,7 @@ export default function (pi: ExtensionAPI) {
 				raw.hostColors = existing;
 			});
 			if (error) return ctx.ui.notify(error, "error");
-			pushStatus(ctx);
+			pushColorChange(ctx);
 			ctx.ui.notify(`${host} pinned to ${describeColor(hue, arg)}.${spreadHint()}`, "info");
 		},
 	});
@@ -432,7 +441,7 @@ export default function (pi: ExtensionAPI) {
 					delete raw.palette;
 				});
 				if (error) return ctx.ui.notify(error, "error");
-				pushStatus(ctx);
+				pushColorChange(ctx);
 				ctx.ui.notify("Cleared the palette; host hues use the full wheel again.", "info");
 				return;
 			}
@@ -450,7 +459,7 @@ export default function (pi: ExtensionAPI) {
 				raw.palette = parts.map((part) => (/^\d+$/.test(part) ? Number(part) : part));
 			});
 			if (error) return ctx.ui.notify(error, "error");
-			pushStatus(ctx);
+			pushColorChange(ctx);
 			// The palette only decides hues for hosts that aren't already colored some other way,
 			// so say so rather than leaving someone to wonder why this tab didn't change.
 			const pinnedNote =

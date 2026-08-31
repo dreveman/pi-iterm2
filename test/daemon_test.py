@@ -5,6 +5,8 @@ import asyncio
 import importlib.util
 import json
 import os
+import re
+import subprocess
 import sys
 import tempfile
 import types
@@ -19,6 +21,12 @@ spec = importlib.util.spec_from_file_location(
 daemon = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(daemon)
 
+shell_spec = importlib.util.spec_from_file_location(
+    "pi_iterm2_tab_color", Path(__file__).parents[1] / "shell" / "tab_color.py"
+)
+shell_color = importlib.util.module_from_spec(shell_spec)
+shell_spec.loader.exec_module(shell_color)
+
 
 class FakeSession:
     session_id = "GUID"
@@ -29,6 +37,7 @@ class FakeSession:
             "user.pi_cwd": "/cwd",
             "user.pi_session": "pi-id",
             "user.pi_status": "idle",
+            "user.pi_host_color": "#010203",
         }[name]
 
 
@@ -78,6 +87,7 @@ async def run_async_tests():
             )
             assert response["ok"] is True
             assert "session id: GUID" in response["output"]
+            assert "hostname:   \x1b[38;2;1;2;3mhost\x1b[39m" in response["output"]
             assert "cwd:        /cwd" in response["output"]
 
             response = await request(
@@ -102,5 +112,35 @@ async def run_async_tests():
 assert daemon.resolve_session_id("w0t0p0:GUID") == "GUID"
 assert daemon.resolve_session_id("GUID") == "GUID"
 assert daemon.resolve_session_id(None) is None
+assert daemon.colored_hostname("host", "#010203") == "\x1b[38;2;1;2;3mhost\x1b[39m"
+assert daemon.colored_hostname("host", "invalid") == "host"
+# Golden vector for JS Math.round compatibility (Python round would make green 76).
+assert shell_color.hsl_to_rgb(30, 45, 30) == (111, 77, 42)
+reminder = daemon.build_reminder_line(
+    {
+        "hostname": "host",
+        "hostColor": "#010203",
+        "cwd": "/cwd",
+        "piSessionId": "pi-id",
+        "status": "idle",
+        "updatedAt": daemon.time.time(),
+    }
+)
+assert "\x1b[22;38;2;1;2;3mhost\x1b[2;39m /cwd" in reminder
 asyncio.run(run_async_tests())
-print("ok - daemon report IPC, permissions, validation, and singleton lock")
+
+with tempfile.TemporaryDirectory(prefix="pi-iterm2-shell-test-") as home:
+    environment = os.environ.copy()
+    environment["HOME"] = home
+    shell_check = subprocess.check_output(
+        [
+            sys.executable,
+            str(Path(__file__).parents[1] / "shell" / "tab_color.py"),
+            "--check",
+        ],
+        env=environment,
+        text=True,
+    )
+    assert re.search(r"host:\s+\x1b\[38;2;\d+;\d+;\d+m.+\x1b\[39m", shell_check)
+
+print("ok - daemon and shell checks color hostnames")

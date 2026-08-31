@@ -18,6 +18,7 @@ which is exactly the "which machine is this tab on" signal.
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -121,7 +122,12 @@ def hsl_to_rgb(hue, saturation, lightness):
         (chroma, 0, second),
     ]
     red, green, blue = order[min(int(sextant), 5)]
-    return tuple(round((channel + base) * 255) for channel in (red, green, blue))
+    # Python round() uses ties-to-even; JavaScript Math.round() rounds positive
+    # half-values up. RGB channels are nonnegative, so floor(x + 0.5) matches it.
+    return tuple(
+        math.floor((channel + base) * 255 + 0.5)
+        for channel in (red, green, blue)
+    )
 
 
 def read_json(path):
@@ -173,6 +179,11 @@ def resolve(host, config):
     return float(fnv1a("host:%s" % host) % 360), "hostname hash"
 
 
+def colored_text(text, rgb):
+    """Render text in a truecolor foreground without resetting other attributes."""
+    return "\x1b[38;2;%d;%d;%dm%s\x1b[39m" % (rgb + (text,))
+
+
 def tab_color_sequence(rgb):
     """The same three OSC 6 sequences buildTabColorSequence() emits, in the same order."""
     return "".join(
@@ -211,7 +222,7 @@ def main():
         sequence = wrap_for_tmux(sequence)
 
     if check:
-        print("host:   %s" % host)
+        print("host:   %s" % colored_text(host, rgb))
         print("hue:    %.1f deg" % hue)
         print("source: %s" % source)
         print(
@@ -227,4 +238,5 @@ def main():
     sys.stdout.write(sequence)
 
 
-main()
+if __name__ == "__main__":
+    main()

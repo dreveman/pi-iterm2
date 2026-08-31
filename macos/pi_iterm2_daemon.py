@@ -17,9 +17,9 @@ user-only Unix socket at ~/.pi-iterm2/daemon.sock. This reuses the daemon's
 already-authenticated iTerm2 connection instead of opening another connection
 from a captured child process, where iTerm2's one-time authentication can fail.
 
-Records, per tab: the `user.pi_cwd` / `user.pi_session` / `user.pi_status`
-variables the pi-iterm2 pi extension publishes (plus `hostname` when it is
-available), into ~/.pi-iterm2/state.json, keyed by the iTerm2 session id
+Records, per tab: the `user.pi_cwd` / `user.pi_session` / `user.pi_status` /
+`user.pi_host_color` variables the pi-iterm2 pi extension publishes (plus
+`hostname` when it is available), into ~/.pi-iterm2/state.json, keyed by the iTerm2 session id
 (Session.session_id, the Python API's `guid`). iTerm2 reapplies a session's
 original guid when restoring a saved window arrangement at startup, so a tab
 keeps the same session id across an iTerm2 restart; keying on it also means
@@ -29,7 +29,8 @@ tab's id is unique regardless of what directory it's in.
 Replays, per tab: when a tab appears with a record from a previous run and no
 pi session currently live in it -- which is exactly the restored-after-a-crash
 case -- one dim line is injected saying what was last running there and how
-long ago. It is injected at tab appearance, while the tab is still showing a
+long ago, with the hostname shown in its recorded host color. It is injected
+at tab appearance, while the tab is still showing a
 plain shell prompt, and deliberately NOT when pi later starts: `async_inject`
 delivers data as though it were program output, so injecting into a running
 pi TUI would land in a screen pi is actively repainting and be overwritten or
@@ -61,6 +62,7 @@ import asyncio
 import fcntl
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -73,6 +75,7 @@ SOCKET_PATH = STATE_PATH.parent / "daemon.sock"
 LOCK_PATH = STATE_PATH.parent / "daemon.lock"
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 16 * 1024
+HOST_COLOR_PATTERN = re.compile(r"#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})")
 
 # Keep the most recently updated records only, so a long-lived install does not
 # accumulate one entry per tab ever opened.
@@ -112,6 +115,7 @@ def record_session(session_id: str, values: dict) -> None:
         "cwd": values["cwd"],
         "piSessionId": values["pi_session"],
         "status": values["pi_status"],
+        "hostColor": values["host_color"],
         "updatedAt": time.time(),
     }
     save_state(state)
@@ -127,6 +131,22 @@ def format_ago(seconds: float) -> str:
     return f"{int(seconds / 86400)}d"
 
 
+def colored_hostname(host, color, dim_context=False) -> str:
+    """Color only the hostname, restoring the surrounding foreground and intensity."""
+    if not isinstance(host, str) or not isinstance(color, str):
+        return str(host)
+    match = HOST_COLOR_PATTERN.fullmatch(color)
+    if match is None:
+        return host
+    red, green, blue = (int(channel, 16) for channel in match.groups())
+    if dim_context:
+        return (
+            f"\x1b[22;38;2;{red};{green};{blue}m{host}"
+            f"\x1b[2;39m"
+        )
+    return f"\x1b[38;2;{red};{green};{blue}m{host}\x1b[39m"
+
+
 def build_reminder_line(prior: Optional[dict]) -> Optional[str]:
     """The single source of truth for what gets replayed into a restored tab. Returns None
     when there is no record to report. Used both to inject the real reminder and, in
@@ -138,7 +158,8 @@ def build_reminder_line(prior: Optional[dict]) -> Optional[str]:
     # location half of the line degrades to just the cwd rather than printing "?".
     host = prior.get("hostname")
     cwd = prior.get("cwd", "?")
-    where = f"{host} {cwd}" if host else cwd
+    display_host = colored_hostname(host, prior.get("hostColor"), dim_context=True)
+    where = f"{display_host} {cwd}" if host else cwd
     return (
         f"\r\n\x1b[2mpi-iterm2: last session in this tab was "
         f"{prior.get('piSessionId', '?')} ({prior.get('status', '?')}) "
@@ -152,6 +173,7 @@ async def read_session_vars(session) -> dict:
         "cwd": await session.async_get_variable("user.pi_cwd"),
         "pi_session": await session.async_get_variable("user.pi_session"),
         "pi_status": await session.async_get_variable("user.pi_status"),
+        "host_color": await session.async_get_variable("user.pi_host_color"),
     }
 
 
@@ -208,7 +230,12 @@ def format_session_report(
     --check, --check-all, and local IPC so the three can never drift apart."""
     lines = [
         f"session id: {session_id}{marker}",
-        f"hostname:   {values['hostname'] or '(unset)'}",
+        "hostname:   "
+        + (
+            colored_hostname(values["hostname"], values.get("host_color"))
+            if values["hostname"]
+            else "(unset)"
+        ),
         f"cwd:        {values['cwd'] or '(unset)'}",
         f"pi_session: {values['pi_session'] or '(unset)'}",
         f"pi_status:  {values['pi_status'] or '(unset)'}",
@@ -239,11 +266,16 @@ def format_session_line(
     """A tab with no stored record has nothing to preview, so --check-all summarizes it in
     one line -- still showing whether pi is live in it -- rather than repeating a full
     empty report per tab."""
-    bits = [
+    bits = []
+    if values["hostname"]:
+        bits.append(
+            "host=" + colored_hostname(values["hostname"], values.get("host_color"))
+        )
+    bits.extend(
         f"{key}={values[key]}"
         for key in ("cwd", "pi_session", "pi_status")
         if values[key]
-    ]
+    )
     label = f"{session_id}{marker}".ljust(width)
     return f"  {label}  {'  '.join(bits) if bits else '(no pi variables set)'}"
 

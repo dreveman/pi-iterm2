@@ -6,13 +6,13 @@
 pi-iterm2: last session in this tab was 01abc... (idle) on devvm123 /home/me/project, 2m ago
 ```
 
-That tells you which host to reconnect to, which working directory to enter, and which exact Pi session to resume. Recovery is independent of SSH, mosh, devserver tooling, or any other connection method because pi-iterm2 records the session identity in the tab itself rather than managing the connection.
+The hostname is printed in that host's tab color, so it remains recognizable at a glance. The message tells you which host to reconnect to, which working directory to enter, and which exact Pi session to resume. Recovery is independent of SSH, mosh, devserver tooling, or any other connection method because pi-iterm2 records the session identity in the tab itself rather than managing the connection.
 
 The extension also ties iTerm2 tabs to the live Pi sessions running in them:
 
 - **Tab color** is derived from hostname (primary), session id (secondary nudge), and live agent status (idle/working/waiting/error) — so tabs on different machines are visually distinct, sessions on the same machine stay in the same color family, and a glance at the tab tells you whether that session needs attention.
 - **Tab title** gets a status icon prefixed while there's something to flag (working/waiting/error), on top of pi's own default title.
-- **cwd and session name are published as iTerm2 user-defined variables** (`\(user.pi_cwd)`, `\(user.pi_session)`, `\(user.pi_status)`), so you can reference them in a custom iTerm2 badge or tab title.
+- **cwd, session name, status, and resolved host color are published as iTerm2 user-defined variables** (`\(user.pi_cwd)`, `\(user.pi_session)`, `\(user.pi_status)`, `\(user.pi_host_color)`), so the companion daemon and custom iTerm2 badges or titles can use them.
 - **Native cwd tracking** (`CurrentDir`/`RemoteHost`) is also enabled, so iTerm2's own directory-inheriting new-tab/split behavior and semantic history work for the session's project directory.
 
 ## Install
@@ -58,7 +58,7 @@ Defaults apply with no configuration file. Override in:
 - `tabColor` — color-code the tab background by host/session/status.
 - `tabTitle` — prefix a status icon on the tab title (see [How the tab title is chosen](#how-the-tab-title-is-chosen)).
 - `currentDir` — emit iTerm2's native `CurrentDir`/`RemoteHost` sequences.
-- `userVars` — publish `pi_cwd`, `pi_session`, and `pi_status` as iTerm2 user-defined variables.
+- `userVars` — publish `pi_cwd`, `pi_session`, `pi_status`, and `pi_host_color` as iTerm2 user-defined variables.
 - `vscodeColor` — take the host's hue from the VS Code window color when one is set for this machine (see [Matching the VS Code window color](#matching-the-vs-code-window-color)). Set it to `false` to ignore that and use the palette or hash instead.
 - `palette`, `hostColors`, `sessionHueSpread` — shape or override the automatic colors (see [Choosing your own colors](#choosing-your-own-colors)).
 
@@ -201,7 +201,7 @@ Sequences are wrapped in tmux's DCS passthrough envelope (`ESC Ptmux; ... ESC \`
 
 ## Displaying host, cwd, and session id
 
-`pi_cwd`, `pi_session`, and `pi_status` are ordinary iTerm2 user-defined variables, referenceable as `\(user.pi_cwd)` etc. `pi_cwd` and `pi_session` are set at session start and on `/name` (session rename); `pi_status` tracks the live agent status (`idle`/`working`/`waiting`/`error`), updating at the same moments as the tab color. All three are cleared on session shutdown.
+`pi_cwd`, `pi_session`, `pi_status`, and `pi_host_color` are ordinary iTerm2 user-defined variables, referenceable as `\(user.pi_cwd)` etc. `pi_cwd`, `pi_session`, and `pi_host_color` are set at session start and when their values change; `pi_status` tracks the live agent status (`idle`/`working`/`waiting`/`error`), updating at the same moments as the tab color. `pi_host_color` is the resolved resting host color as `#rrggbb`, before the per-session nudge and live-status brightness. All four are cleared on session shutdown.
 
 For **cwd and host specifically, prefer iTerm2's built-in variables instead**: `\(session.path)` and `\(session.hostname)` are auto-populated from the same `CurrentDir`/`RemoteHost` sequences this extension already sends, so `pi_cwd` is redundant with `session.path`. (`session.hostname`/`session.username` normally require iTerm2's own shell-integration script to be installed on the remote host — this extension's `RemoteHost` sequence populates them without that.) `pi_session` (the session id) has no iTerm2 built-in equivalent, since iTerm2 has no concept of it.
 
@@ -216,7 +216,7 @@ Note that none of badge/title/status-bar text is mouse-selectable (it's UI chrom
 
 ## macOS companion daemon
 
-`macos/pi_iterm2_daemon.py` is a standalone script that runs on the Mac, separately from the pi extension — it is not required for the tab color/user var/`CurrentDir` features above, which work without it. It records each tab's host, `pi_cwd`, `pi_session`, and `pi_status` into `~/.pi-iterm2/state.json` (keyed by iTerm2 session id, capped at the 200 most recent), so that a tab restored after iTerm2, the local system, or the remote host restarts can say exactly where and how to resume its previous Pi session.
+`macos/pi_iterm2_daemon.py` is a standalone script that runs on the Mac, separately from the pi extension — it is not required for the tab color/user var/`CurrentDir` features above, which work without it. It records each tab's host, host color, `pi_cwd`, `pi_session`, and `pi_status` into `~/.pi-iterm2/state.json` (keyed by iTerm2 session id, capped at the 200 most recent), so that a tab restored after iTerm2, the local system, or the remote host restarts can say exactly where and how to resume its previous Pi session. The restored reminder and the `--check`/`--check-all` reports render each hostname in its recorded host color.
 
 The reminder is injected **when the tab appears and no pi session is live in it** — i.e. while it's still showing a plain shell prompt — and deliberately not when pi later starts. `async_inject` delivers data as though it were program output, so injecting into a running pi TUI would land in a screen pi is actively repainting and be overwritten or corrupt it; a tab that already has a live pi session is skipped for the same reason.
 

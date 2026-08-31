@@ -303,6 +303,11 @@ export function computeTabColorRgb(
 	return tabColorForHue(hue, status);
 }
 
+/** Stable serialized form published so the local daemon knows a remote host's exact color. */
+export function rgbToHex(rgb: Rgb): string {
+	return `#${rgb.r.toString(16).padStart(2, "0")}${rgb.g.toString(16).padStart(2, "0")}${rgb.b.toString(16).padStart(2, "0")}`;
+}
+
 /**
  * A solid two-cell block in the given color, for previewing a color inline in command
  * output. Uses a truecolor background rather than a glyph so it renders as a filled swatch
@@ -538,16 +543,18 @@ export function buildStatusSequences(
 }
 
 /** Everything that identifies the session rather than its status; only changes at session start and rename. */
-export function buildIdentitySequences(config: PiIterm2Config, identity: SessionIdentity): string {
+export function buildIdentitySequences(config: PiIterm2Config, identity: SessionIdentity, hostColor?: Rgb): string {
 	let out = "";
 	if (config.userVars) {
-		out += buildSetUserVarSequence("pi_cwd", identity.cwd);
+		if (hostColor) out += buildSetUserVarSequence("pi_host_color", rgbToHex(hostColor));
 		out += buildSetUserVarSequence("pi_session", identity.sessionName);
 	}
 	if (config.currentDir) {
 		out += buildCurrentDirSequence(identity.cwd);
 		out += buildRemoteHostSequence(identity.user, identity.host);
 	}
+	// pi_cwd is the daemon's recording trigger, so publish every other identity field first.
+	if (config.userVars) out += buildSetUserVarSequence("pi_cwd", identity.cwd);
 	return out;
 }
 
@@ -559,6 +566,7 @@ export function buildResetSequences(config: PiIterm2Config): string {
 		out += buildSetUserVarSequence("pi_cwd", "");
 		out += buildSetUserVarSequence("pi_session", "");
 		out += buildSetUserVarSequence("pi_status", "");
+		out += buildSetUserVarSequence("pi_host_color", "");
 	}
 	return out;
 }

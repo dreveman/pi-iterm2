@@ -24,6 +24,7 @@ import {
 	hueSwatch,
 	parseColorSpec,
 	tabColorForHue,
+	rgbToHex,
 	rgbToHue,
 	hslToRgb,
 	parseConfig,
@@ -96,6 +97,7 @@ test("hslToRgb matches known primary colors", () => {
 	assert.deepEqual(hslToRgb(240, 100, 50), { r: 0, g: 0, b: 255 });
 	assert.deepEqual(hslToRgb(0, 0, 100), { r: 255, g: 255, b: 255 });
 	assert.deepEqual(hslToRgb(0, 0, 0), { r: 0, g: 0, b: 0 });
+	assert.deepEqual(hslToRgb(30, 45, 30), { r: 111, g: 77, b: 42 });
 });
 
 test("computeTabColorRgb varies by host, session, and status but is stable for the same inputs", () => {
@@ -209,12 +211,18 @@ test("buildStatusSequences honors the tabColor and userVars toggles independentl
 	assert.equal(buildStatusSequences({ ...DEFAULT_CONFIG, tabColor: false, userVars: false }, IDENTITY, "s1", "working"), "");
 });
 
-test("buildIdentitySequences emits cwd/session vars and CurrentDir/RemoteHost per config", () => {
-	const full = buildIdentitySequences(DEFAULT_CONFIG, IDENTITY);
+test("buildIdentitySequences emits cwd/session/color vars and CurrentDir/RemoteHost per config", () => {
+	const hostColor = { r: 1, g: 2, b: 3 };
+	const full = buildIdentitySequences(DEFAULT_CONFIG, IDENTITY, hostColor);
 	assert.equal(full.includes(buildSetUserVarSequence("pi_cwd", "/proj")), true);
 	assert.equal(full.includes(buildSetUserVarSequence("pi_session", "sess")), true);
+	assert.equal(full.includes(buildSetUserVarSequence("pi_host_color", "#010203")), true);
 	assert.equal(full.includes(buildCurrentDirSequence("/proj")), true);
 	assert.equal(full.includes(buildRemoteHostSequence("dave", "box")), true);
+	const trigger = full.indexOf("pi_cwd");
+	assert.equal(full.indexOf("pi_host_color") < trigger, true);
+	assert.equal(full.indexOf("pi_session") < trigger, true);
+	assert.equal(full.indexOf("RemoteHost") < trigger, true);
 
 	// currentDir off must not disturb the user vars the daemon depends on.
 	const noDir = buildIdentitySequences({ ...DEFAULT_CONFIG, currentDir: false }, IDENTITY);
@@ -226,7 +234,7 @@ test("buildIdentitySequences emits cwd/session vars and CurrentDir/RemoteHost pe
 test("buildResetSequences clears every var it sets and restores the default tab color", () => {
 	const seq = buildResetSequences(DEFAULT_CONFIG);
 	assert.equal(seq.includes(buildResetTabColorSequence()), true);
-	for (const name of ["pi_cwd", "pi_session", "pi_status"]) {
+	for (const name of ["pi_cwd", "pi_session", "pi_status", "pi_host_color"]) {
 		assert.equal(seq.includes(buildSetUserVarSequence(name, "")), true, `${name} not cleared`);
 	}
 	assert.equal(buildResetSequences({ ...DEFAULT_CONFIG, tabColor: false, userVars: false }), "");
@@ -266,6 +274,10 @@ test("parseColorSpec accepts hues and #rrggbb, and rejects junk", () => {
 	for (const junk of ["red", "#fff", "#gggggg", "", null, undefined, {}, true]) {
 		assert.equal(parseColorSpec(junk), undefined, `should reject ${JSON.stringify(junk)}`);
 	}
+});
+
+test("rgbToHex serializes a host color for the daemon", () => {
+	assert.equal(rgbToHex({ r: 0, g: 15, b: 255 }), "#000fff");
 });
 
 test("colorSwatch renders a truecolor block that can't clobber surrounding styling", () => {
