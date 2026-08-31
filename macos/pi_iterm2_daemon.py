@@ -78,10 +78,13 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     """Write via a temp file and atomic replace. A plain truncate-and-write would leave
     invalid JSON behind if iTerm2 quit mid-write -- the very event this feature exists to
-    survive -- and load_state() treats invalid JSON as empty, silently losing everything."""
+    survive -- and load_state() treats invalid JSON as empty, silently losing everything.
+    """
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     if len(state) > MAX_RECORDS:
-        newest = sorted(state.items(), key=lambda kv: kv[1].get("updatedAt", 0), reverse=True)
+        newest = sorted(
+            state.items(), key=lambda kv: kv[1].get("updatedAt", 0), reverse=True
+        )
         state = dict(newest[:MAX_RECORDS])
     tmp = STATE_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
@@ -193,7 +196,9 @@ async def daemon_main(connection):
 
     # Covers every session that exists now, plus every one created later. The framework
     # cancels each task when its session terminates.
-    await iterm2.EachSessionOnceMonitor.async_foreach_session_create_task(app, on_session)
+    await iterm2.EachSessionOnceMonitor.async_foreach_session_create_task(
+        app, on_session
+    )
 
 
 def resolve_session_id(explicit: Optional[str]) -> Optional[str]:
@@ -204,7 +209,9 @@ def resolve_session_id(explicit: Optional[str]) -> Optional[str]:
     return env_value.rsplit(":", 1)[-1] if env_value else None
 
 
-def print_session_report(session_id: str, values: dict, prior: Optional[dict], marker: str = "") -> None:
+def print_session_report(
+    session_id: str, values: dict, prior: Optional[dict], marker: str = ""
+) -> None:
     """One session's live variables, stored record, and what would be injected. Shared by
     --check and --check-all so the two can never drift apart."""
     print(f"session id: {session_id}{marker}")
@@ -224,22 +231,33 @@ def print_session_report(session_id: str, values: dict, prior: Optional[dict], m
     print(line.strip("\r\n"))
     if values["pi_session"]:
         print()
-        print("Note: suppressed while pi is live in this tab. The reminder is injected only")
-        print("when a tab appears with no pi session running, so it cannot land in pi's TUI.")
+        print(
+            "Note: suppressed while pi is live in this tab. The reminder is injected only"
+        )
+        print(
+            "when a tab appears with no pi session running, so it cannot land in pi's TUI."
+        )
 
 
-def format_session_line(session_id: str, values: dict, marker: str = "", width: int = 0) -> str:
+def format_session_line(
+    session_id: str, values: dict, marker: str = "", width: int = 0
+) -> str:
     """A tab with no stored record has nothing to preview, so --check-all summarizes it in
     one line -- still showing whether pi is live in it -- rather than repeating a full
     empty report per tab."""
-    bits = [f"{key}={values[key]}" for key in ("cwd", "pi_session", "pi_status") if values[key]]
+    bits = [
+        f"{key}={values[key]}"
+        for key in ("cwd", "pi_session", "pi_status")
+        if values[key]
+    ]
     label = f"{session_id}{marker}".ljust(width)
     return f"  {label}  {'  '.join(bits) if bits else '(no pi variables set)'}"
 
 
 def all_sessions(app) -> list:
     """Every live session: all panes of all tabs of all windows, including panes minimized
-    behind a maximized one, plus buried sessions (which live outside the window tree)."""
+    behind a maximized one, plus buried sessions (which live outside the window tree).
+    """
     sessions = []
     for window in app.windows:
         for tab in window.tabs:
@@ -252,8 +270,14 @@ async def check_main(connection, session_id: Optional[str]):
     app = await iterm2.async_get_app(connection)
     resolved_id = resolve_session_id(session_id)
     if not resolved_id:
-        print("No session id given and ITERM_SESSION_ID is not set. Run this from inside", file=sys.stderr)
-        print("an iTerm2 tab, or pass --session <id>, or use --check-all.", file=sys.stderr)
+        print(
+            "No session id given and ITERM_SESSION_ID is not set. Run this from inside",
+            file=sys.stderr,
+        )
+        print(
+            "an iTerm2 tab, or pass --session <id>, or use --check-all.",
+            file=sys.stderr,
+        )
         return
 
     session = app.get_session_by_id(resolved_id)
@@ -278,7 +302,11 @@ async def check_all_main(connection):
     recorded, unrecorded = [], []
     for session in sessions:
         session_id = session.session_id
-        entry = (session_id, await read_session_vars(session), "  <- this tab" if session_id == current_id else "")
+        entry = (
+            session_id,
+            await read_session_vars(session),
+            "  <- this tab" if session_id == current_id else "",
+        )
         (recorded if state.get(session_id) else unrecorded).append(entry)
 
     if recorded:
@@ -291,27 +319,45 @@ async def check_all_main(connection):
 
     if unrecorded:
         print(f"Tabs with no stored record ({len(unrecorded)}):")
-        width = max(len(f"{session_id}{marker}") for session_id, _, marker in unrecorded)
+        width = max(
+            len(f"{session_id}{marker}") for session_id, _, marker in unrecorded
+        )
         for session_id, values, marker in unrecorded:
             print(format_session_line(session_id, values, marker, width))
         print()
 
     orphans = [key for key in state if key not in {s.session_id for s in sessions}]
     print("=" * 72)
-    print(f"{len(sessions)} live session(s); {len(state)} stored record(s), {len(orphans)} for tabs that no longer exist.")
+    print(
+        f"{len(sessions)} live session(s); {len(state)} stored record(s), {len(orphans)} for tabs that no longer exist."
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--check", action="store_true", help="Preview one session instead of running the daemon.")
-    parser.add_argument("--check-all", action="store_true", help="Preview every live session instead of running the daemon.")
-    parser.add_argument("--session", help="Session id for --check (defaults to the current session).")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Preview one session instead of running the daemon.",
+    )
+    parser.add_argument(
+        "--check-all",
+        action="store_true",
+        help="Preview every live session instead of running the daemon.",
+    )
+    parser.add_argument(
+        "--session", help="Session id for --check (defaults to the current session)."
+    )
     args = parser.parse_args()
 
     if args.check_all:
         iterm2.run_until_complete(check_all_main)
     elif args.check:
-        iterm2.run_until_complete(lambda connection: check_main(connection, args.session))
+        iterm2.run_until_complete(
+            lambda connection: check_main(connection, args.session)
+        )
     else:
         iterm2.run_forever(daemon_main)
 
