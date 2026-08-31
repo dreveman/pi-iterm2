@@ -410,7 +410,9 @@ async def handle_control_request(reader, writer, connection, report_lock) -> Non
         response = {"version": PROTOCOL_VERSION, "ok": True, "output": output}
     except asyncio.TimeoutError:
         response["error"] = "Timed out while handling daemon request."
-    except (ValueError, json.JSONDecodeError) as error:
+    # json.JSONDecodeError is a ValueError, so this covers a malformed request body as
+    # well as the explicit raises above.
+    except ValueError as error:
         response["error"] = str(error) or "Invalid daemon request."
     except Exception as error:
         response["error"] = f"Could not query iTerm2: {error}"
@@ -418,13 +420,14 @@ async def handle_control_request(reader, writer, connection, report_lock) -> Non
     try:
         writer.write((json.dumps(response) + "\n").encode("utf-8"))
         await writer.drain()
-    except (BrokenPipeError, ConnectionError):
+    # BrokenPipeError is a ConnectionError; a client that hung up mid-report is normal.
+    except ConnectionError:
         pass
     finally:
         writer.close()
         try:
             await writer.wait_closed()
-        except (BrokenPipeError, ConnectionError):
+        except ConnectionError:
             pass
 
 
