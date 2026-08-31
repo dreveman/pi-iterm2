@@ -12,6 +12,7 @@ import {
 	buildTabTitle,
 	deriveStatus,
 	hostHue,
+	hueSwatch,
 	parseColorSpec,
 	parseConfigText,
 	shouldActivate,
@@ -307,7 +308,7 @@ export default function (pi: ExtensionAPI) {
 		if (config.tabTitle) ctx.ui.setTitle(buildTabTitle("", sessionDisplayName, basename(identity.cwd)));
 	});
 
-	// Picking a colour is a look-at-it task, so these apply to the live tab immediately and
+	// Picking a color is a look-at-it task, so these apply to the live tab immediately and
 	// persist to the config file, rather than making you edit JSON and /reload to see it.
 	// The typed spec is stored verbatim ("#4a7ba7" stays "#4a7ba7"), not the derived hue.
 	const spreadHint = () =>
@@ -316,15 +317,15 @@ export default function (pi: ExtensionAPI) {
 			: "";
 
 	pi.registerCommand("iterm2-color", {
-		description: "Show, set, or clear this host's pinned tab colour (e.g. /iterm2-color #4a7ba7)",
+		description: "Show, set, or clear this host's pinned tab color (e.g. /iterm2-color #4a7ba7)",
 		handler: async (args, ctx) => {
 			const arg = args.trim();
 			const pinned = config.hostColors[host];
 			if (!arg) {
 				ctx.ui.notify(
 					pinned === undefined
-						? `${host} has no pinned colour (hue ${Math.round(hostHue(host, config.palette, config.hostColors))}° from ${config.palette.length ? "palette" : "hash"}). Set one with /iterm2-color <#rrggbb|hue>.`
-						: `${host} is pinned to hue ${Math.round(pinned)}°. Clear it with /iterm2-color clear.`,
+						? `${host} ${hueSwatch(hostHue(host, config.palette, config.hostColors))} hue ${Math.round(hostHue(host, config.palette, config.hostColors))}° (from ${config.palette.length ? "palette" : "hash"}, not pinned). Set one with /iterm2-color <#rrggbb|hue>.`
+						: `${host} ${hueSwatch(pinned)} pinned to hue ${Math.round(pinned)}°. Clear it with /iterm2-color clear.`,
 					"info",
 				);
 				return;
@@ -336,12 +337,12 @@ export default function (pi: ExtensionAPI) {
 				});
 				if (error) return ctx.ui.notify(error, "error");
 				pushStatus(ctx);
-				ctx.ui.notify(`Cleared the pinned colour for ${host}.`, "info");
+				ctx.ui.notify(`Cleared the pinned color for ${host}.`, "info");
 				return;
 			}
 			const hue = parseColorSpec(arg);
 			if (hue === undefined) {
-				ctx.ui.notify(`"${arg}" is not a hue 0-359 or a #rrggbb colour.`, "error");
+				ctx.ui.notify(`"${arg}" is not a hue 0-359 or a #rrggbb color.`, "error");
 				return;
 			}
 			config.hostColors[host] = hue;
@@ -352,19 +353,19 @@ export default function (pi: ExtensionAPI) {
 			});
 			if (error) return ctx.ui.notify(error, "error");
 			pushStatus(ctx);
-			ctx.ui.notify(`${host} pinned to ${arg} (hue ${Math.round(hue)}°).${spreadHint()}`, "info");
+			ctx.ui.notify(`${host} ${hueSwatch(hue)} pinned to ${arg} (hue ${Math.round(hue)}°).${spreadHint()}`, "info");
 		},
 	});
 
 	pi.registerCommand("iterm2-palette", {
-		description: "Show, set, or clear the palette hosts are coloured from (e.g. /iterm2-palette #4a7ba7 #a74a5c)",
+		description: "Show, set, or clear the palette hosts are colored from (e.g. /iterm2-palette #4a7ba7 #a74a5c)",
 		handler: async (args, ctx) => {
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			if (parts.length === 0) {
 				ctx.ui.notify(
 					config.palette.length === 0
-						? "No palette set; host hues come from the full 0-360° wheel. Set one with /iterm2-palette <colour> <colour> ..."
-						: `Palette: ${config.palette.map((hue) => `${Math.round(hue)}°`).join(", ")}. Clear it with /iterm2-palette clear.`,
+						? "No palette set; host hues come from the full 0-360° wheel. Set one with /iterm2-palette <color> <color> ..."
+						: `Palette: ${config.palette.map((hue) => `${hueSwatch(hue)} ${Math.round(hue)}°`).join("  ")}. Clear it with /iterm2-palette clear.`,
 					"info",
 				);
 				return;
@@ -383,7 +384,7 @@ export default function (pi: ExtensionAPI) {
 			for (const part of parts) {
 				const hue = parseColorSpec(part);
 				if (hue === undefined) {
-					ctx.ui.notify(`"${part}" is not a hue 0-359 or a #rrggbb colour.`, "error");
+					ctx.ui.notify(`"${part}" is not a hue 0-359 or a #rrggbb color.`, "error");
 					return;
 				}
 				hues.push(hue);
@@ -395,7 +396,7 @@ export default function (pi: ExtensionAPI) {
 			if (error) return ctx.ui.notify(error, "error");
 			pushStatus(ctx);
 			const pinnedNote = config.hostColors[host] === undefined ? "" : ` (${host} stays pinned; /iterm2-color clear to unpin)`;
-			ctx.ui.notify(`Palette set to ${parts.length} colour(s)${pinnedNote}.${spreadHint()}`, "info");
+			ctx.ui.notify(`Palette set: ${hues.map((hue) => `${hueSwatch(hue)} ${Math.round(hue)}°`).join("  ")}${pinnedNote}.${spreadHint()}`, "info");
 		},
 	});
 }

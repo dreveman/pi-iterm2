@@ -87,7 +87,7 @@ Colors are accepted either as `"#rrggbb"` or as a bare hue number (`0`–`359`).
 Rather than editing JSON and reloading to see the result, two commands change the live tab immediately and save the result to the same config file:
 
 ```
-/iterm2-color                          show this host's current colour and where it came from
+/iterm2-color                          show this host's current color and where it came from
 /iterm2-color #4a7ba7                  pin this host (also accepts a bare hue, e.g. 208)
 /iterm2-color clear                    unpin it
 
@@ -96,7 +96,15 @@ Rather than editing JSON and reloading to see the result, two commands change th
 /iterm2-palette clear                  back to the full hue wheel
 ```
 
+Each reported color is preceded by a swatch of the actual tab color it produces, so you can see the result inline — which matters most for `/iterm2-palette`, where a whole palette can be previewed at once even though a tab can only show one color at a time:
+
+```
+Palette set: ██ 0°  ██ 120°  ██ 240°
+```
+
 They rewrite `~/.pi/agent/pi-iterm2.json` in place, preserving any other settings in it, and store what you typed (`#4a7ba7` stays `#4a7ba7`) rather than the derived hue. `sessionHueSpread` has no command — it's a set-once preference, so edit the file for that.
+
+Settings are per host: the file lives in the home directory of whichever machine pi runs on, and applies to every session there. Entries are keyed by hostname inside it, so one synced dotfile can carry a color per machine. Pi re-reads the file when a session is replaced, so `/new`, `/resume`, and `/fork` pick up hand-edits without restarting pi.
 
 The tab color and user variables reset on session shutdown.
 

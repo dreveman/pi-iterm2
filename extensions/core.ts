@@ -126,7 +126,7 @@ export function parseColorSpec(value: unknown): number | undefined {
 	if (typeof value !== "string") return undefined;
 	const text = value.trim();
 
-	// Hex is matched before a plain number so a bare six-digit string stays a colour
+	// Hex is matched before a plain number so a bare six-digit string stays a color
 	// ("123456" is #123456, not hue 123456). Everything arriving from a slash command is a
 	// string, so a hue typed as text has to parse here too, not just as a JSON number.
 	const hex = /^#?([0-9a-fA-F]{6})$/.exec(text);
@@ -138,12 +138,32 @@ export function parseColorSpec(value: unknown): number | undefined {
 	return undefined;
 }
 
+/** The tab color a given hue produces at a given status, i.e. hue plus the status brightness. */
+export function tabColorForHue(hue: number, status: AgentStatus = "idle"): Rgb {
+	const style = STATUS_STYLE[status];
+	return hslToRgb(hue, style.saturation, style.lightness);
+}
+
 /** Combine host, session, and status into one tab color: host sets hue, session nudges it, status sets brightness. */
 export function computeTabColorRgb(config: PiIterm2Config, host: string, sessionId: string, status: AgentStatus): Rgb {
 	const hue =
 		(hostHue(host, config.palette, config.hostColors) + sessionHueOffset(sessionId, config.sessionHueSpread) + 360) % 360;
-	const style = STATUS_STYLE[status];
-	return hslToRgb(hue, style.saturation, style.lightness);
+	return tabColorForHue(hue, status);
+}
+
+/**
+ * A solid two-cell block in the given color, for previewing a color inline in command
+ * output. Uses a truecolor background rather than a glyph so it renders as a filled swatch
+ * in any font. Closes with a background-only reset (49) rather than a full reset (0) so it
+ * cannot clobber the styling of whatever text it is embedded in.
+ */
+export function colorSwatch(rgb: Rgb): string {
+	return `\x1b[48;2;${rgb.r};${rgb.g};${rgb.b}m  \x1b[49m`;
+}
+
+/** Swatch for a hue at its resting (idle) tab brightness, which is what a host's color "is". */
+export function hueSwatch(hue: number): string {
+	return colorSwatch(tabColorForHue(hue, "idle"));
 }
 
 export interface StatusState {

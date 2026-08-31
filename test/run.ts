@@ -10,12 +10,15 @@ import {
 	buildStatusSequences,
 	buildTabColorSequence,
 	buildTabTitle,
+	colorSwatch,
 	computeTabColorRgb,
 	DEFAULT_CONFIG,
 	deriveStatus,
 	hashString,
 	hostHue,
+	hueSwatch,
 	parseColorSpec,
+	tabColorForHue,
 	rgbToHue,
 	hslToRgb,
 	parseConfig,
@@ -228,11 +231,24 @@ test("parseColorSpec accepts hues and #rrggbb, and rejects junk", () => {
 	assert.equal(parseColorSpec("120"), 120);
 	assert.equal(parseColorSpec(" 400 "), 40);
 	assert.equal(parseColorSpec("-30"), 330);
-	// ...but a bare six-digit string stays a hex colour, not a huge hue.
+	// ...but a bare six-digit string stays a hex color, not a huge hue.
 	assert.equal(parseColorSpec("123456"), rgbToHue({ r: 0x12, g: 0x34, b: 0x56 }));
 	for (const junk of ["red", "#fff", "#gggggg", "", null, undefined, {}, true]) {
 		assert.equal(parseColorSpec(junk), undefined, `should reject ${JSON.stringify(junk)}`);
 	}
+});
+
+test("colorSwatch renders a truecolor block that can't clobber surrounding styling", () => {
+	assert.equal(colorSwatch({ r: 1, g: 2, b: 3 }), "\x1b[48;2;1;2;3m  \x1b[49m");
+	// A full reset (0) would kill the caller's foreground style; only the background resets.
+	assert.equal(colorSwatch({ r: 1, g: 2, b: 3 }).includes("\x1b[0m"), false);
+});
+
+test("hueSwatch previews a hue at its resting tab brightness", () => {
+	assert.equal(hueSwatch(120), colorSwatch(tabColorForHue(120, "idle")));
+	assert.deepEqual(tabColorForHue(0, "idle"), hslToRgb(0, 45, 30));
+	// Same hue, different status = different swatch, matching what the tab actually shows.
+	assert.notDeepEqual(tabColorForHue(120, "idle"), tabColorForHue(120, "working"));
 });
 
 test("palette constrains host hues to the configured set", () => {
