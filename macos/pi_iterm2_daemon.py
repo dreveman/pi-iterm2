@@ -77,6 +77,27 @@ PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 16 * 1024
 HOST_COLOR_PATTERN = re.compile(r"#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})")
 
+# Everything this daemon reports comes from iTerm2 session variables, and any process that
+# can write to a terminal can set those with OSC 1337;SetUserVar -- the payload is base64,
+# so arbitrary bytes, ESC included, survive into the variable intact. Those values get
+# persisted and later replayed into a tab as terminal output, so a hostile cwd or session
+# name would otherwise be executed as escape sequences in a tab it was never typed in.
+# Strip control bytes at the boundary, the same way the extension's sanitizeOscText() does
+# before emitting a raw OSC payload.
+CONTROL_BYTES_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
+
+# Also bound the length, so one very long value can't push the rest of a report off screen.
+MAX_FIELD_LENGTH = 256
+
+
+def sanitize_text(value: Optional[str], limit: int = MAX_FIELD_LENGTH) -> Optional[str]:
+    """Strip control bytes and cap the length. None and "" pass through unchanged, since
+    callers distinguish "unset" from "set to something"."""
+    if not value:
+        return value
+    return CONTROL_BYTES_PATTERN.sub("", value)[:limit]
+
+
 # Keep the most recently updated records only, so a long-lived install does not
 # accumulate one entry per tab ever opened.
 MAX_RECORDS = 200
@@ -151,26 +172,38 @@ def build_reminder_line(prior: Optional[dict]) -> Optional[str]:
     if not prior:
         return None
     ago = format_ago(time.time() - prior.get("updatedAt", time.time()))
+    # Sanitized again on the way out, not just on the way in: a state file written by an
+    # older build, or edited by hand, is replayed straight into a terminal from here.
+    host = sanitize_text(prior.get("hostname"))
+    cwd = sanitize_text(prior.get("cwd")) or "?"
+    pi_session_id = sanitize_text(prior.get("piSessionId")) or "?"
+    status = sanitize_text(prior.get("status")) or "?"
     # hostname is only populated when the extension's `currentDir` option is on, so the
     # location half of the line degrades to just the cwd rather than printing "?".
-    host = prior.get("hostname")
-    cwd = prior.get("cwd", "?")
     display_host = colored_hostname(host, prior.get("hostColor"), dim_context=True)
     where = f"{display_host} {cwd}" if host else cwd
     return (
         f"\r\n\x1b[2mpi-iterm2: last session in this tab was "
-        f"{prior.get('piSessionId', '?')} ({prior.get('status', '?')}) "
+        f"{pi_session_id} ({status}) "
         f"on {where}, {ago} ago\x1b[0m\r\n"
     )
 
 
 async def read_session_vars(session) -> dict:
+    """Sanitized at this boundary, so nothing downstream -- the state file, the reports, the
+    injected reminder -- ever handles a value with control bytes in it."""
     return {
-        "hostname": await session.async_get_variable("hostname"),
-        "cwd": await session.async_get_variable("user.pi_cwd"),
-        "pi_session": await session.async_get_variable("user.pi_session"),
-        "pi_status": await session.async_get_variable("user.pi_status"),
-        "host_color": await session.async_get_variable("user.pi_host_color"),
+        "hostname": sanitize_text(await session.async_get_variable("hostname")),
+        "cwd": sanitize_text(await session.async_get_variable("user.pi_cwd")),
+        "pi_session": sanitize_text(
+            await session.async_get_variable("user.pi_session")
+        ),
+        "pi_status": sanitize_text(await session.async_get_variable("user.pi_status")),
+        # Validated by HOST_COLOR_PATTERN before use, but sanitizing is free and keeps the
+        # rule "everything read from a session variable is cleaned here" without exception.
+        "host_color": sanitize_text(
+            await session.async_get_variable("user.pi_host_color")
+        ),
     }
 
 
