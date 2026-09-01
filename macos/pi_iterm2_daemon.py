@@ -407,53 +407,42 @@ async def check_all_main(connection):
     print(await build_check_all_report(connection, os.environ.get("ITERM_SESSION_ID")))
 
 
-async def handle_control_request(reader, writer, connection, report_lock) -> None:
-    """Serve one bounded, read-only request over the user-owned local socket."""
-    response = {"version": PROTOCOL_VERSION, "ok": False}
-    try:
-        line = await asyncio.wait_for(reader.readline(), timeout=5)
-        if not line or len(line) > MAX_REQUEST_BYTES or not line.endswith(b"\n"):
-            raise ValueError("Invalid or oversized daemon request.")
-        request = json.loads(line)
-        if not isinstance(request, dict):
-            raise ValueError("Daemon request must be a JSON object.")
-        version = request.get("version")
-        if (
-            not isinstance(version, int)
-            or isinstance(version, bool)
-            or version != PROTOCOL_VERSION
-        ):
-            raise ValueError("Incompatible daemon protocol version.")
-        command = request.get("command")
-        session_id = request.get("sessionId")
-        if session_id is not None and not isinstance(session_id, str):
-            raise ValueError("sessionId must be a string.")
+def parse_control_request(line: bytes) -> tuple[Optional[str], Optional[str]]:
+    """Validate one request line and return its (command, session id). Raises ValueError
+    with a client-facing message for anything malformed; nothing here trusts the caller,
+    since any process running as this user can reach the socket."""
+    if not line or len(line) > MAX_REQUEST_BYTES or not line.endswith(b"\n"):
+        raise ValueError("Invalid or oversized daemon request.")
+    request = json.loads(line)
+    if not isinstance(request, dict):
+        raise ValueError("Daemon request must be a JSON object.")
+    # An exact type check, not isinstance: bool subclasses int, so True would otherwise
+    # read as version 1.
+    version = request.get("version")
+    if type(version) is not int or version != PROTOCOL_VERSION:
+        raise ValueError("Incompatible daemon protocol version.")
+    session_id = request.get("sessionId")
+    if session_id is not None and not isinstance(session_id, str):
+        raise ValueError("sessionId must be a string.")
+    return request.get("command"), session_id
 
-        async def run_report():
-            async with report_lock:
-                if command == "check":
-                    return await build_check_report(connection, session_id)
-                if command == "check-all":
-                    return await build_check_all_report(connection, session_id)
-                raise ValueError("Unknown daemon command.")
 
-        # Include time waiting behind another report in the deadline, and leave a
-        # margin before the extension client's 15-second timeout.
-        output = await asyncio.wait_for(run_report(), timeout=14)
-        response = {"version": PROTOCOL_VERSION, "ok": True, "output": output}
-    except asyncio.TimeoutError:
-        response["error"] = "Timed out while handling daemon request."
-    # json.JSONDecodeError is a ValueError, so this covers a malformed request body as
-    # well as the explicit raises above.
-    except ValueError as error:
-        response["error"] = str(error) or "Invalid daemon request."
-    except Exception as error:
-        response["error"] = f"Could not query iTerm2: {error}"
+async def run_control_command(connection, command, session_id: Optional[str]) -> str:
+    """The whole command surface: two read-only reports, and nothing else."""
+    if command == "check":
+        return await build_check_report(connection, session_id)
+    if command == "check-all":
+        return await build_check_all_report(connection, session_id)
+    raise ValueError("Unknown daemon command.")
 
+
+async def write_control_response(writer, response: dict) -> None:
+    """Best effort by design: a client that hung up mid-report is ordinary, and there is
+    nowhere useful to report a failure to reply to it."""
     try:
         writer.write((json.dumps(response) + "\n").encode("utf-8"))
         await writer.drain()
-    # BrokenPipeError is a ConnectionError; a client that hung up mid-report is normal.
+    # BrokenPipeError is a ConnectionError.
     except ConnectionError:
         pass
     finally:
@@ -462,6 +451,35 @@ async def handle_control_request(reader, writer, connection, report_lock) -> Non
             await writer.wait_closed()
         except ConnectionError:
             pass
+
+
+async def handle_control_request(reader, writer, connection, report_lock) -> None:
+    """Serve one bounded, read-only request over the user-owned local socket. Reads,
+    dispatches, and always answers: every failure below becomes an error field in the
+    response rather than a dropped connection."""
+    response = {"version": PROTOCOL_VERSION, "ok": False}
+    try:
+        line = await asyncio.wait_for(reader.readline(), timeout=5)
+        command, session_id = parse_control_request(line)
+
+        async def run_report():
+            async with report_lock:
+                return await run_control_command(connection, command, session_id)
+
+        # Include time waiting behind another report in the deadline, and leave a
+        # margin before the extension client's 15-second timeout.
+        output = await asyncio.wait_for(run_report(), timeout=14)
+        response = {"version": PROTOCOL_VERSION, "ok": True, "output": output}
+    except asyncio.TimeoutError:
+        response["error"] = "Timed out while handling daemon request."
+    # json.JSONDecodeError is a ValueError, so this covers a malformed request body as
+    # well as the explicit raises in parse_control_request.
+    except ValueError as error:
+        response["error"] = str(error) or "Invalid daemon request."
+    except Exception as error:
+        response["error"] = f"Could not query iTerm2: {error}"
+
+    await write_control_response(writer, response)
 
 
 def prepare_state_directory() -> None:
