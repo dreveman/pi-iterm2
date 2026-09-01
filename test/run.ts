@@ -441,6 +441,23 @@ test("vsCodeHueFromSettings treats anything unusable as no color", () => {
 	assert.equal(vsCodeHueFromSettings(vscodeSettings({ "titleBar.activeBackground": "red" })), undefined);
 });
 
+test("stripJsonComments leaves a trailing-comma sequence inside a string alone", () => {
+	// The comma here is data, not syntax. A regex pass over the finished text would eat it
+	// and silently corrupt the value.
+	assert.equal(stripJsonComments('{"a": "foo,}"}'), '{"a": "foo,}"}');
+	assert.equal(stripJsonComments('{"a": "bar,]"}'), '{"a": "bar,]"}');
+	assert.equal(stripJsonComments('{"a": "x,   }"}'), '{"a": "x,   }"}');
+	assert.deepEqual(JSON.parse(stripJsonComments('{"a": "foo,}", /* c */ "b": 1,}')), { a: "foo,}", b: 1 });
+});
+
+test("stripJsonComments drops a trailing comma even with comments or whitespace after it", () => {
+	assert.equal(stripJsonComments('{"a": 1, /* c */ }'), '{"a": 1  }');
+	assert.equal(stripJsonComments('{"a": 1, // c\n}'), '{"a": 1 \n}');
+	assert.equal(stripJsonComments('[1, 2,\n\t]'), "[1, 2\n\t]");
+	// Nested closers each resolve their own pending comma.
+	assert.equal(stripJsonComments('{"a": [1,],}'), '{"a": [1]}');
+});
+
 test("stripJsonComments removes comments and trailing commas but not string contents", () => {
 	assert.equal(stripJsonComments('{"a": 1} // trailing'), '{"a": 1} ');
 	assert.equal(stripJsonComments('{"a": 1, /* mid */ "b": 2}'), '{"a": 1,  "b": 2}');

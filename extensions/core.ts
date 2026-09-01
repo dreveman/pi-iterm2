@@ -191,17 +191,25 @@ export function hueFromCssHex(value: string): number | undefined {
  * scanner rather than a regex.
  */
 export function stripJsonComments(text: string): string {
-	let out = "";
+	const out: string[] = [];
 	let inString = false;
 	let inLineComment = false;
 	let inBlockComment = false;
+	// Index in `out` of a comma that may turn out to be trailing, resolved when the next
+	// meaningful character arrives: dropped if that character closes the object or array,
+	// kept otherwise. Deciding it here, mid-scan, rather than with a regex over the finished
+	// text is what keeps a string value containing ",}" from being rewritten -- the whole
+	// point of scanning with string-awareness in the first place.
+	let pendingComma: number | undefined;
 	for (let i = 0; i < text.length; i++) {
 		const char = text[i]!;
 		const next = text[i + 1];
 		if (inLineComment) {
 			if (char === "\n") {
 				inLineComment = false;
-				out += char;
+				// Kept so line numbers survive, and harmless to a pending comma: a newline is
+				// whitespace, which never resolves one.
+				out.push(char);
 			}
 			continue;
 		}
@@ -213,21 +221,16 @@ export function stripJsonComments(text: string): string {
 			continue;
 		}
 		if (inString) {
-			out += char;
+			out.push(char);
 			if (char === "\\") {
 				// Copy the escaped character verbatim so an escaped quote can't end the string.
 				if (next !== undefined) {
-					out += next;
+					out.push(next);
 					i++;
 				}
 			} else if (char === '"') {
 				inString = false;
 			}
-			continue;
-		}
-		if (char === '"') {
-			inString = true;
-			out += char;
 			continue;
 		}
 		if (char === "/" && next === "/") {
@@ -240,9 +243,16 @@ export function stripJsonComments(text: string): string {
 			i++;
 			continue;
 		}
-		out += char;
+		// Whitespace and comments are allowed to sit between a trailing comma and the bracket
+		// that makes it trailing, so only a meaningful character resolves the pending comma.
+		if (!/\s/.test(char)) {
+			if (pendingComma !== undefined && (char === "}" || char === "]")) out[pendingComma] = "";
+			pendingComma = char === "," ? out.length : undefined;
+		}
+		if (char === '"') inString = true;
+		out.push(char);
 	}
-	return out.replace(/,(\s*[}\]])/g, "$1");
+	return out.join("");
 }
 
 /** JSON first, JSONC only as a fallback, so a strict file never pays for the scanner. */
