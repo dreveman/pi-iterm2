@@ -28,7 +28,8 @@ const WORKING_ICON_INTERVAL_MS = 1000;
 
 const CONFIG_PATH = join(getAgentDir(), "pi-iterm2.json");
 
-const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+// extensions/pi-iterm2/index.ts -> the package root is three levels up.
+const PACKAGE_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const DAEMON_SOURCE_PATH = join(PACKAGE_ROOT, "macos", "pi_iterm2_daemon.py");
 const AUTOLAUNCH_DIR = join(homedir(), "Library", "Application Support", "iTerm2", "Scripts", "AutoLaunch");
 const DAEMON_INSTALL_PATH = join(AUTOLAUNCH_DIR, "pi_iterm2_daemon.py");

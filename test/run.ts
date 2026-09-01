@@ -39,12 +39,12 @@ import {
 	stripJsonComments,
 	vsCodeHueFromSettings,
 	VSCODE_COLOR_KEYS,
-} from "../extensions/core.ts";
+} from "../extensions/pi-iterm2/core.ts";
 import {
 	DAEMON_PROTOCOL_VERSION,
 	normalizeItermSessionId,
 	requestDaemonReport,
-} from "../extensions/daemon-client.ts";
+} from "../extensions/pi-iterm2/daemon-client.ts";
 
 /** A VS Code machine settings file as the tools that colorize a window actually write it. */
 function vscodeSettings(colors: Record<string, string> | undefined, extra: Record<string, unknown> = {}): string {
