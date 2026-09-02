@@ -1,6 +1,6 @@
 {
   "name": "pi-iterm2",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Color-code iTerm2 tabs by host, session, and live agent status for the Pi coding agent.",
   "type": "module",
   "keywords": [
