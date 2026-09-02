@@ -51,8 +51,8 @@ const STATIC_STATUS_ICON: Record<Exclude<AgentStatus, "working">, string> = {
 	error: "✖",
 };
 
-/** The four rotations of the same half-circle glyph, cycled for a spinning "working" indicator. */
-export const WORKING_ICON_FRAMES = ["◐", "◓", "◑", "◒"] as const;
+/** Pi's default Working spinner frames, kept in the same order as its TUI loader. */
+export const WORKING_ICON_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 
 /** Which icon to show right now: a rotating frame while working, a fixed icon otherwise. */
 export function statusIcon(status: AgentStatus, workingFrame: number): string {
@@ -407,6 +407,8 @@ export interface PiIterm2Config {
 	tabTitle: boolean;
 	currentDir: boolean;
 	userVars: boolean;
+	/** Ask before running a displayed restore command from the shell hook. */
+	promptRestore: boolean;
 	/** Hues hosts are assigned from. Empty means the full 0-360 wheel. */
 	palette: number[];
 	/** Hostname -> hue, pinning specific machines regardless of hash or palette. */
@@ -426,6 +428,7 @@ export function defaultConfig(): PiIterm2Config {
 		tabTitle: true,
 		currentDir: true,
 		userVars: true,
+		promptRestore: false,
 		vscodeColor: true,
 		palette: [],
 		hostColors: {},
@@ -445,7 +448,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-const BOOLEAN_FIELDS = ["tabColor", "tabTitle", "currentDir", "userVars", "vscodeColor"] as const;
+const BOOLEAN_FIELDS = ["tabColor", "tabTitle", "currentDir", "userVars", "promptRestore", "vscodeColor"] as const;
 
 const COLOR_HINT = "a hue 0-359 or a \"#rrggbb\" color";
 
@@ -528,7 +531,9 @@ export function shouldActivate(enabled: EnabledSetting, env: NodeJS.ProcessEnv):
 
 export interface SessionIdentity {
 	cwd: string;
+	sessionId: string;
 	sessionName: string;
+	instanceId: string;
 	user: string;
 	host: string;
 }
@@ -558,13 +563,18 @@ export function buildIdentitySequences(config: PiIterm2Config, identity: Session
 	if (config.userVars) {
 		if (hostColor) out += buildSetUserVarSequence("pi_host_color", rgbToHex(hostColor));
 		out += buildSetUserVarSequence("pi_session", identity.sessionName);
+		out += buildSetUserVarSequence("pi_session_id", identity.sessionId);
 	}
 	if (config.currentDir) {
 		out += buildCurrentDirSequence(identity.cwd);
 		out += buildRemoteHostSequence(identity.user, identity.host);
 	}
-	// pi_cwd is the daemon's recording trigger, so publish every other identity field first.
-	if (config.userVars) out += buildSetUserVarSequence("pi_cwd", identity.cwd);
+	// The daemon monitors both of these as snapshot triggers. The fresh per-Pi instance
+	// token is deliberately last, after every value the resulting snapshot must contain.
+	if (config.userVars) {
+		out += buildSetUserVarSequence("pi_cwd", identity.cwd);
+		out += buildSetUserVarSequence("pi_instance", identity.instanceId);
+	}
 	return out;
 }
 
@@ -575,6 +585,8 @@ export function buildResetSequences(config: PiIterm2Config): string {
 	if (config.userVars) {
 		out += buildSetUserVarSequence("pi_cwd", "");
 		out += buildSetUserVarSequence("pi_session", "");
+		out += buildSetUserVarSequence("pi_session_id", "");
+		out += buildSetUserVarSequence("pi_instance", "");
 		out += buildSetUserVarSequence("pi_status", "");
 		out += buildSetUserVarSequence("pi_host_color", "");
 	}

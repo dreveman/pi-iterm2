@@ -23,7 +23,7 @@
     "test/*.ts",
     "test/*.py",
     "macos/*.py",
-    "shell/*.py",
+    "shell/*.sh",
     "tsconfig.json",
     "README.md",
     "LICENSE"

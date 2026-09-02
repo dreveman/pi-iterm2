@@ -1,0 +1,8 @@
+# Formatting only: the extension ships plain scripts, not an installable package.
+# Black's defaults plus an explicit target version keep this repo byte-identical
+# to downstream vendored copies, which format with the same settings. Without
+# target-version, Black infers it per file and avoids 3.9+ syntax such as
+# parenthesized context managers, which then reflows on import.
+[tool.black]
+line-length = 88
+target-version = ["py39"]

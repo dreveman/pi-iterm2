@@ -1,5 +1,6 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname, userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,17 +23,84 @@ import {
 	type SessionIdentity,
 	type StatusState,
 } from "./core.ts";
-import { requestDaemonReport, type DaemonCommand } from "./daemon-client.ts";
-
-const WORKING_ICON_INTERVAL_MS = 1000;
+const WORKING_ICON_INTERVAL_MS = 80;
 
 const CONFIG_PATH = join(getAgentDir(), "pi-iterm2.json");
 
 // extensions/pi-iterm2/index.ts -> the package root is three levels up.
 const PACKAGE_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const DAEMON_SOURCE_PATH = join(PACKAGE_ROOT, "macos", "pi_iterm2_daemon.py");
+const SHELL_HOOK_SOURCE_PATH = join(PACKAGE_ROOT, "shell", "pi_iterm2_restore.sh");
 const AUTOLAUNCH_DIR = join(homedir(), "Library", "Application Support", "iTerm2", "Scripts", "AutoLaunch");
 const DAEMON_INSTALL_PATH = join(AUTOLAUNCH_DIR, "pi_iterm2_daemon.py");
+const STATE_DIR = join(homedir(), ".pi-iterm2");
+const SHELL_HOOK_INSTALL_PATH = join(STATE_DIR, "shell.sh");
+const SHELL_HELPER_INSTALL_PATH = join(STATE_DIR, "pi_iterm2.py");
+const SHELL_IDENTITY_ENABLED_PATH = join(STATE_DIR, "shell-identity-enabled");
+const REMOTE_LOCATION_ENABLED_PATH = join(STATE_DIR, "remote-location-enabled");
+const RECORD_INDEX_PATH = join(STATE_DIR, "record-ids");
+const PREVIOUS_STATE_PATH = join(STATE_DIR, "state.previous.json");
+const SHELL_SOURCE_LINE = 'test -e "${HOME}/.pi-iterm2/shell.sh" && source "${HOME}/.pi-iterm2/shell.sh"';
+
+const LEGACY_SHELL_SOURCE_LINES = new Set([
+	'source "$HOME/.pi-iterm2/shell.sh"',
+	"source ~/.pi-iterm2/shell.sh",
+	'. "$HOME/.pi-iterm2/shell.sh"',
+	". ~/.pi-iterm2/shell.sh",
+]);
+
+function refreshRecordIndex(): void {
+	const ids = new Set<string>();
+	try {
+		const value: unknown = JSON.parse(readFileSync(PREVIOUS_STATE_PATH, "utf8"));
+		if (isPlainObject(value)) {
+			for (const id of Object.keys(value)) {
+				if (/^[A-Za-z0-9._-]+$/.test(id)) ids.add(id);
+			}
+		}
+	} catch {
+		// The recorder creates the recovery index on the next iTerm2 launch.
+	}
+	const temporaryPath = `${RECORD_INDEX_PATH}.tmp`;
+	writeFileSync(temporaryPath, [...ids].sort().map((id) => `${id}\n`).join(""), { encoding: "utf8", mode: 0o600 });
+	chmodSync(temporaryPath, 0o600);
+	renameSync(temporaryPath, RECORD_INDEX_PATH);
+}
+
+export function configureShellRc(path: string): "added" | "updated" | "already present" {
+	let text = "";
+	let exists = true;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch (error) {
+		if (!hasErrorCode(error, "ENOENT")) throw error;
+		exists = false;
+	}
+	const newline = text.includes("\r\n") ? "\r\n" : "\n";
+	const lines = text.length > 0 ? text.split(/\r?\n/) : [];
+	if (lines.at(-1) === "") lines.pop();
+	const isSourceLine = (line: string) => line.trim() === SHELL_SOURCE_LINE || LEGACY_SHELL_SOURCE_LINES.has(line.trim());
+	const hadSourceLine = lines.some(isSourceLine);
+	const cleaned = lines.filter((line) => !isSourceLine(line));
+	const instantPromptIndex = cleaned.findIndex(
+		(line) => line.includes("Powerlevel10k instant prompt") || line.includes("p10k-instant-prompt-"),
+	);
+	cleaned.splice(instantPromptIndex >= 0 ? instantPromptIndex : cleaned.length, 0, SHELL_SOURCE_LINE);
+	const updated = `${cleaned.join(newline)}${newline}`;
+	if (updated === text) return "already present";
+
+	const temporaryPath = `${path}.pi-iterm2.tmp-${process.pid}`;
+	try {
+		writeFileSync(temporaryPath, updated, {
+			encoding: "utf8",
+			mode: exists ? statSync(path).mode & 0o777 : 0o600,
+		});
+		renameSync(temporaryPath, path);
+	} finally {
+		rmSync(temporaryPath, { force: true });
+	}
+	return hadSourceLine ? "updated" : "added";
+}
 
 /**
  * VS Code's machine-scope settings, where a per-machine window color lives. Machine scope
@@ -125,67 +193,123 @@ export default function (pi: ExtensionAPI) {
 	let configWarning = loadedConfig.warning;
 	const active = shouldActivate(config.enabled, process.env);
 
-	// Registered unconditionally (not gated on `active`): these install/check the macOS
-	// daemon, which is useful whenever pi is running on a Mac, independent of whether the
-	// current terminal happens to be recognized as iTerm2.
-	pi.registerCommand("iterm2-daemon-install", {
-		description: "Install (or update) the pi-iterm2 macOS companion daemon as an iTerm2 AutoLaunch script",
+	// Registered unconditionally: installation is useful on any Mac, independent of
+	// whether this particular Pi session is running inside iTerm2.
+	pi.registerCommand("iterm2-install", {
+		description: "Install or update the pi-iterm2 daemon and shell integration",
 		handler: async (_args, ctx) => {
-			if (process.platform !== "darwin") {
-				ctx.ui.notify("The companion daemon only runs on macOS.", "error");
-				return;
+			const isDarwin = process.platform === "darwin";
+			const confirm = (title: string, description: string) =>
+				ctx.ui.confirm(title, `\n${ctx.ui.theme.fg("text", description)}`);
+			const results: string[] = [];
+			let daemonInstalled = false;
+			let shellInstalled = false;
+			let shellConfigured = false;
+			let shellIdentityEnabled = false;
+			let shellAvailable = existsSync(SHELL_HOOK_INSTALL_PATH) && existsSync(SHELL_HELPER_INSTALL_PATH);
+			if (isDarwin && (await confirm("Install pi-iterm2 recorder?", `This will copy the AutoLaunch recorder to ${DAEMON_INSTALL_PATH}.`))) {
+				if (!existsSync(DAEMON_SOURCE_PATH)) {
+					ctx.ui.notify(`Daemon source not found at ${DAEMON_SOURCE_PATH}. Reinstall the pi-iterm2 package.`, "error");
+				} else {
+					try {
+						mkdirSync(AUTOLAUNCH_DIR, { recursive: true });
+						rmSync(join(AUTOLAUNCH_DIR, "__pycache__"), { recursive: true, force: true });
+						copyFileSync(DAEMON_SOURCE_PATH, DAEMON_INSTALL_PATH);
+						results.push(`daemon: ${DAEMON_INSTALL_PATH}`);
+						daemonInstalled = true;
+					} catch (error) {
+						ctx.ui.notify(`Daemon install failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+					}
+				}
 			}
-			if (!existsSync(DAEMON_SOURCE_PATH)) {
-				ctx.ui.notify(`Daemon source not found at ${DAEMON_SOURCE_PATH}. Reinstall the pi-iterm2 package.`, "error");
-				return;
+
+			const installShell = await confirm(
+				"Install pi-iterm2 shell integration?",
+				isDarwin
+					? `This will copy the shell integration, helper, and shell check commands to ${STATE_DIR}.`
+					: `This will copy the host/cwd publishing hook to ${SHELL_HOOK_INSTALL_PATH}.`,
+			);
+			if (installShell) {
+				if (!existsSync(SHELL_HOOK_SOURCE_PATH) || (isDarwin && !existsSync(DAEMON_SOURCE_PATH))) {
+					ctx.ui.notify("Shell integration source is missing. Reinstall the pi-iterm2 package.", "error");
+				} else {
+					try {
+						mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+						chmodSync(STATE_DIR, 0o700);
+						copyFileSync(SHELL_HOOK_SOURCE_PATH, SHELL_HOOK_INSTALL_PATH);
+						results.push(`shell integration: ${SHELL_HOOK_INSTALL_PATH}`);
+						if (isDarwin) {
+							copyFileSync(DAEMON_SOURCE_PATH, SHELL_HELPER_INSTALL_PATH);
+							refreshRecordIndex();
+							results.push(`shell helper: ${SHELL_HELPER_INSTALL_PATH}`);
+						} else {
+							writeFileSync(REMOTE_LOCATION_ENABLED_PATH, "enabled\n", { encoding: "utf8", mode: 0o600 });
+							results.push("remote host/cwd publishing: enabled");
+						}
+						shellInstalled = true;
+						shellAvailable = true;
+					} catch (error) {
+						ctx.ui.notify(`Shell integration install failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+					}
+				}
+
+				if (shellInstalled) {
+					for (const [name, path, note] of [
+						["zsh", join(homedir(), ".zshrc"), ""],
+						["bash", join(homedir(), ".bashrc"), " Login bash must source ~/.bashrc from ~/.bash_profile."],
+					] as const) {
+						if (await confirm(`Configure ${name}?`, `This will add '${SHELL_SOURCE_LINE}' to ${path}.${note}`)) {
+							try {
+								results.push(`${path}: ${configureShellRc(path)}`);
+								shellConfigured = true;
+							} catch (error) {
+								ctx.ui.notify(`Could not update ${path}: ${error instanceof Error ? error.message : String(error)}`, "error");
+							}
+						}
+					}
+				}
 			}
-			try {
-				mkdirSync(AUTOLAUNCH_DIR, { recursive: true });
-				copyFileSync(DAEMON_SOURCE_PATH, DAEMON_INSTALL_PATH);
-				ctx.ui.notify(
-					`Installed ${DAEMON_INSTALL_PATH}. Enable Settings -> General -> Magic -> Enable Python API, then restart iTerm2 for it to start.`,
-					"info",
+
+			if (isDarwin && shellAvailable && (await confirm(
+				"Apply host identity to ordinary shells?",
+				"This will use the same resting host color for shell tabs that do not run Pi.",
+			))) {
+				try {
+					writeFileSync(SHELL_IDENTITY_ENABLED_PATH, "enabled\n", { encoding: "utf8", mode: 0o600 });
+					results.push("ordinary shell host identity: enabled");
+					shellIdentityEnabled = true;
+				} catch (error) {
+					ctx.ui.notify(`Shell identity install failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+				}
+			}
+
+			if (isDarwin && shellAvailable && (await confirm(
+				"Offer to run restore commands?",
+				'This will ask "Run it now? [y/N]" after printing a restore command. Press y to run it immediately; any other key declines.',
+			))) {
+				const error = updateConfigFile((raw) => {
+					raw.promptRestore = true;
+				});
+				if (error) ctx.ui.notify(error, "error");
+				else results.push("restore execution prompt: enabled");
+			}
+
+			const nextSteps: string[] = [];
+			if (daemonInstalled) {
+				nextSteps.push("Enable the iTerm2 Python API, install its Python runtime, and restart iTerm2.");
+			}
+			if (shellInstalled) {
+				nextSteps.push(
+					shellConfigured
+						? "Reload the configured shell file or open a new shell."
+						: `Add '${SHELL_SOURCE_LINE}' to your shell rc file, then reload it.`,
 				);
-			} catch (error) {
-				ctx.ui.notify(`Install failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+			} else if (shellIdentityEnabled) {
+				nextSteps.push("Reload your shell rc file or open a new shell.");
 			}
+			const summary = results.length > 0 ? `Installed:\n${results.join("\n")}` : "Nothing installed.";
+			ctx.ui.notify(nextSteps.length > 0 ? `${summary}\n\nNext:\n${nextSteps.join("\n")}` : summary, "info");
 		},
-	});
-
-	const runDaemonCheck = async (ctx: ExtensionContext, command: DaemonCommand) => {
-		if (process.platform !== "darwin") {
-			ctx.ui.notify("The companion daemon only runs on macOS.", "error");
-			return;
-		}
-		if (!existsSync(DAEMON_INSTALL_PATH)) {
-			ctx.ui.notify("Daemon isn't installed yet. Run /iterm2-daemon-install first.", "error");
-			return;
-		}
-		try {
-			const output = await requestDaemonReport(command, process.env.ITERM_SESSION_ID);
-			ctx.ui.notify(output.trim() || "(no output)", "info");
-		} catch (error) {
-			const code =
-				typeof error === "object" && error !== null && "code" in error
-					? String((error as { code?: unknown }).code)
-					: undefined;
-			const detail = error instanceof Error ? error.message : String(error);
-			const hint =
-				code === "ENOENT" || code === "ECONNREFUSED"
-					? "The installed daemon is not running (or predates local check support). Run /iterm2-daemon-install, then restart iTerm2."
-					: detail;
-			ctx.ui.notify(`Check failed: ${hint}`, "error");
-		}
-	};
-
-	pi.registerCommand("iterm2-daemon-check", {
-		description: "Preview what the pi-iterm2 macOS daemon would print if this tab were restored right now",
-		handler: async (_args, ctx) => runDaemonCheck(ctx, "check"),
-	});
-
-	pi.registerCommand("iterm2-daemon-check-all", {
-		description: "Preview the pi-iterm2 macOS daemon's record for every live iTerm2 session",
-		handler: async (_args, ctx) => runDaemonCheck(ctx, "check-all"),
 	});
 
 	if (!active) return;
@@ -195,7 +319,7 @@ export default function (pi: ExtensionAPI) {
 	const status: StatusState = { agentRunning: false, promptOpen: false, hadError: false };
 	let sessionId = "";
 	let sessionDisplayName = ""; // empty when unnamed; used for the tab title only
-	let identity: SessionIdentity = { cwd: "", sessionName: "", user, host };
+	let identity: SessionIdentity = { cwd: "", sessionId: "", sessionName: "", instanceId: "", user, host };
 	let workingFrame = 0;
 	let workingTimer: NodeJS.Timeout | undefined;
 	// Read once per session rather than watched: the color is a property of the machine, so it
@@ -221,7 +345,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Pi only manages the tab title itself at session rebind, rename, and shutdown, never
 	// during a turn, so setting it at these points doesn't fight with pi's own title. While
-	// working, a timer spins the icon through its frames once a second; any other status
+	// working, a timer matches Pi's 80ms Working spinner; any other status
 	// stops that timer so it can't keep ticking once idle. The interval is unref'd so it can
 	// never by itself hold the process open on an exit path that skips session_shutdown.
 	const pushTitle = (ctx: ExtensionContext) => {
@@ -254,7 +378,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const pushColorChange = (ctx: ExtensionContext) => {
-		// Publish status and identity fields before pi_cwd triggers the daemon's snapshot.
+		// Publish status before the identity sequence's snapshot triggers.
 		pushStatus(ctx);
 		pushIdentity(ctx);
 	};
@@ -263,7 +387,14 @@ export default function (pi: ExtensionAPI) {
 		stopWorkingTimer();
 		sessionId = ctx.sessionManager.getSessionId();
 		sessionDisplayName = ctx.sessionManager.getSessionName() ?? "";
-		identity = { cwd: ctx.cwd, sessionName: sessionDisplayName || sessionId, user, host };
+		identity = {
+			cwd: ctx.cwd,
+			sessionId,
+			sessionName: sessionDisplayName || sessionId,
+			instanceId: randomUUID(),
+			user,
+			host,
+		};
 		status.agentRunning = false;
 		status.promptOpen = false;
 		status.hadError = false;
@@ -273,7 +404,7 @@ export default function (pi: ExtensionAPI) {
 			configWarning = undefined;
 		}
 
-		// pi_status and RemoteHost must be set before pi_cwd triggers the daemon's snapshot.
+		// pi_status must be set before the identity sequence's snapshot triggers.
 		pushStatus(ctx);
 		pushIdentity(ctx);
 	});

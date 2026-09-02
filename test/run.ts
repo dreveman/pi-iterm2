@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
-import { createServer } from "node:net";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -40,12 +39,7 @@ import {
 	vsCodeHueFromSettings,
 	VSCODE_COLOR_KEYS,
 } from "../extensions/pi-iterm2/core.ts";
-import {
-	DAEMON_PROTOCOL_VERSION,
-	normalizeItermSessionId,
-	requestDaemonReport,
-} from "../extensions/pi-iterm2/daemon-client.ts";
-
+import { configureShellRc } from "../extensions/pi-iterm2/index.ts";
 /** A VS Code machine settings file as the tools that colorize a window actually write it. */
 function vscodeSettings(colors: Record<string, string> | undefined, extra: Record<string, unknown> = {}): string {
 	return JSON.stringify({ ...extra, ...(colors === undefined ? {} : { "workbench.colorCustomizations": colors }) }, null, 2);
@@ -150,7 +144,8 @@ test("statusIcon is empty for idle and a fixed glyph for waiting/error", () => {
 	assert.equal(statusIcon("error", 3), "✖");
 });
 
-test("statusIcon cycles through the working frames and wraps around", () => {
+test("statusIcon cycles through Pi's Working spinner frames and wraps around", () => {
+	assert.deepEqual(WORKING_ICON_FRAMES, ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
 	const seen = WORKING_ICON_FRAMES.map((_, i) => statusIcon("working", i));
 	assert.deepEqual(seen, [...WORKING_ICON_FRAMES]);
 	assert.equal(statusIcon("working", WORKING_ICON_FRAMES.length), WORKING_ICON_FRAMES[0]);
@@ -183,7 +178,14 @@ test("parseConfig applies defaults, validates types, and rejects unknown fields"
 	assert.ok(parseConfigText("{").warning);
 });
 
-const IDENTITY = { cwd: "/proj", sessionName: "sess", user: "dave", host: "box" };
+const IDENTITY = {
+	cwd: "/proj",
+	sessionId: "session-id",
+	sessionName: "sess",
+	instanceId: "instance-1",
+	user: "dave",
+	host: "box",
+};
 
 test("buildStatusSequences publishes pi_status for every status, not just idle", () => {
 	// Regression guard: the status var was previously only written from the session-start
@@ -216,12 +218,16 @@ test("buildIdentitySequences emits cwd/session/color vars and CurrentDir/RemoteH
 	const full = buildIdentitySequences(DEFAULT_CONFIG, IDENTITY, hostColor);
 	assert.equal(full.includes(buildSetUserVarSequence("pi_cwd", "/proj")), true);
 	assert.equal(full.includes(buildSetUserVarSequence("pi_session", "sess")), true);
+	assert.equal(full.includes(buildSetUserVarSequence("pi_session_id", "session-id")), true);
+	assert.equal(full.includes(buildSetUserVarSequence("pi_instance", "instance-1")), true);
 	assert.equal(full.includes(buildSetUserVarSequence("pi_host_color", "#010203")), true);
 	assert.equal(full.includes(buildCurrentDirSequence("/proj")), true);
 	assert.equal(full.includes(buildRemoteHostSequence("dave", "box")), true);
-	const trigger = full.indexOf("pi_cwd");
+	const trigger = full.indexOf("pi_instance");
 	assert.equal(full.indexOf("pi_host_color") < trigger, true);
 	assert.equal(full.indexOf("pi_session") < trigger, true);
+	assert.equal(full.indexOf("pi_session_id") < trigger, true);
+	assert.equal(full.indexOf("pi_cwd") < trigger, true);
 	assert.equal(full.indexOf("RemoteHost") < trigger, true);
 
 	// currentDir off must not disturb the user vars the daemon depends on.
@@ -234,7 +240,7 @@ test("buildIdentitySequences emits cwd/session/color vars and CurrentDir/RemoteH
 test("buildResetSequences clears every var it sets and restores the default tab color", () => {
 	const seq = buildResetSequences(DEFAULT_CONFIG);
 	assert.equal(seq.includes(buildResetTabColorSequence()), true);
-	for (const name of ["pi_cwd", "pi_session", "pi_status", "pi_host_color"]) {
+	for (const name of ["pi_cwd", "pi_session", "pi_session_id", "pi_instance", "pi_status", "pi_host_color"]) {
 		assert.equal(seq.includes(buildSetUserVarSequence(name, "")), true, `${name} not cleared`);
 	}
 	assert.equal(buildResetSequences({ ...DEFAULT_CONFIG, tabColor: false, userVars: false }), "");
@@ -361,11 +367,6 @@ test("wrapForTmux wraps in a DCS envelope and doubles inner ESC bytes inside tmu
 	assert.equal(wrapped.endsWith("\x1b\\"), true);
 });
 
-test("normalizeItermSessionId accepts both iTerm's prefixed value and a bare guid", () => {
-	assert.equal(normalizeItermSessionId("w3t0p0:ABC-123"), "ABC-123");
-	assert.equal(normalizeItermSessionId("ABC-123"), "ABC-123");
-	assert.equal(normalizeItermSessionId(undefined), undefined);
-});
 test("hueFromCssHex accepts every hex form VS Code writes and ignores alpha", () => {
 	assert.equal(hueFromCssHex("#2250A8"), rgbToHue({ r: 0x22, g: 0x50, b: 0xa8 }));
 	// Shorthand doubles each digit, so #25a is #2255aa.
@@ -520,6 +521,12 @@ test("buildStatusSequences applies the VS Code hue to the tab color", () => {
 	);
 });
 
+test("promptRestore is a boolean config field, off by default", () => {
+	assert.equal(defaultConfig().promptRestore, false);
+	assert.equal(parseConfig({ promptRestore: true }).config.promptRestore, true);
+	assert.match(String(parseConfig({ promptRestore: "yes" }).warning), /promptRestore must be a boolean/);
+});
+
 test("vscodeColor is a boolean config field, on by default", () => {
 	assert.equal(defaultConfig().vscodeColor, true);
 	assert.equal(parseConfig({ vscodeColor: false }).config.vscodeColor, false);
@@ -529,46 +536,42 @@ test("vscodeColor is a boolean config field, on by default", () => {
 	assert.equal(parseConfig({ palette: ["#8abeb7"] }).config.vscodeColor, true);
 });
 
-async function testDaemonClient(): Promise<void> {
-	const directory = mkdtempSync(join(tmpdir(), "pi-iterm2-test-"));
-	const socketPath = join(directory, "daemon.sock");
-	const server = createServer((socket) => {
-		let request = "";
-		socket.on("data", (chunk) => {
-			request += chunk.toString("utf8");
-			if (!request.includes("\n")) return;
-			assert.deepEqual(JSON.parse(request.trim()), {
-				version: DAEMON_PROTOCOL_VERSION,
-				command: "check",
-				sessionId: "ABC-123",
-			});
-			const response = `${JSON.stringify({ version: DAEMON_PROTOCOL_VERSION, ok: true, output: "report" })}\n`;
-			// Deliberately split the response to exercise stream framing.
-			socket.write(response.slice(0, 5));
-			socket.end(response.slice(5));
-		});
-	});
-
+test("configureShellRc appends or migrates guarded source lines idempotently", () => {
+	const directory = mkdtempSync(join(tmpdir(), "pi-iterm2-rc-test-"));
+	const guarded = 'test -e "${HOME}/.pi-iterm2/shell.sh" && source "${HOME}/.pi-iterm2/shell.sh"';
 	try {
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(socketPath, resolve);
-		});
-		assert.equal(
-			await requestDaemonReport("check", "w3t0p0:ABC-123", { socketPath, timeoutMs: 1_000 }),
-			"report",
+		const missing = join(directory, "missing-rc");
+		assert.equal(configureShellRc(missing), "added");
+		assert.equal(readFileSync(missing, "utf8"), `${guarded}\n`);
+		assert.equal(configureShellRc(missing), "already present");
+
+		const existing = join(directory, "existing-rc");
+		writeFileSync(existing, "export BEFORE=1", "utf8");
+		assert.equal(configureShellRc(existing), "added");
+		assert.equal(readFileSync(existing, "utf8"), `export BEFORE=1\n${guarded}\n`);
+		assert.equal(configureShellRc(existing), "already present");
+
+		const variant = join(directory, "variant-rc");
+		writeFileSync(variant, "source ~/.pi-iterm2/shell.sh\n", "utf8");
+		assert.equal(configureShellRc(variant), "updated");
+		assert.equal(readFileSync(variant, "utf8"), `${guarded}\n`);
+		assert.equal(configureShellRc(variant), "already present");
+
+		const p10k = join(directory, "p10k-rc");
+		writeFileSync(
+			p10k,
+			'# Enable Powerlevel10k instant prompt. Should stay close to the top.\nif [[ -r "p10k-instant-prompt-user.zsh" ]]; then\n  source "p10k-instant-prompt-user.zsh"\nfi\nsource "$HOME/.pi-iterm2/shell.sh"\n',
+			"utf8",
 		);
-		passed++;
-		console.log("ok - daemon client sends a normalized request and reads a chunked response");
+		assert.equal(configureShellRc(p10k), "updated");
+		assert.equal(readFileSync(p10k, "utf8").split("\n")[0], guarded);
 	} finally {
-		await new Promise<void>((resolve) => server.close(() => resolve()));
 		rmSync(directory, { recursive: true, force: true });
 	}
-}
+});
 
 console.log(`${passed} synchronous tests passed`);
 
 export default async function (_pi: ExtensionAPI): Promise<void> {
-	await testDaemonClient();
 	console.log(`${passed} tests passed`);
 }

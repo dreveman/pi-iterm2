@@ -12,71 +12,93 @@ Python environment this runs under (with the `iterm2` module included);
 enabling the API alone does not. iTerm2 runs AutoLaunch scripts
 automatically on startup once both are done.
 
-While running, serves the Pi extension's read-only check commands over a
-user-only Unix socket at ~/.pi-iterm2/daemon.sock. This reuses the daemon's
-already-authenticated iTerm2 connection instead of opening another connection
-from a captured child process, where iTerm2's one-time authentication can fail.
-
-Records, per tab: the `user.pi_cwd` / `user.pi_session` / `user.pi_status` /
-`user.pi_host_color` variables the pi-iterm2 pi extension publishes (plus
-`hostname` when it is available), into ~/.pi-iterm2/state.json, keyed by the iTerm2 session id
+Records, per tab: iTerm2's built-in `hostname`, `username`, and `path` plus
+the `user.pi_cwd` / `user.pi_session` / `user.pi_session_id` /
+`user.pi_instance` / `user.pi_status` / `user.pi_host_color` variables the
+pi-iterm2 Pi extension publishes, into ~/.pi-iterm2/state.json, keyed by the
+iTerm2 session id
 (Session.session_id, the Python API's `guid`). iTerm2 reapplies a session's
 original guid when restoring a saved window arrangement at startup, so a tab
 keeps the same session id across an iTerm2 restart; keying on it also means
 two tabs open in the same directory at once can never collide, since each
 tab's id is unique regardless of what directory it's in.
 
-Replays, per tab: when a tab appears with a record from a previous run and no
-pi session currently live in it -- which is exactly the restored-after-a-crash
-case -- one dim line is injected saying what was last running there and how
-long ago, with the hostname shown in its recorded host color. It is injected
-at tab appearance, while the tab is still showing a
-plain shell prompt, and deliberately NOT when pi later starts: `async_inject`
-delivers data as though it were program output, so injecting into a running
-pi TUI would land in a screen pi is actively repainting and be overwritten or
-corrupt it. A tab that already has a live pi session is skipped for the same
-reason.
+On each new iTerm2 application launch, the daemon merges completed state into
+~/.pi-iterm2/state.previous.json and starts a fresh state.json. An
+application-scoped run marker prevents duplicate rotation within one launch.
 
-Session-id persistence across a restart has not been verified against a live
-iTerm2 instance; confirm it holds before relying on this.
+A synchronous shell pre-prompt hook invokes this script's hidden
+--emit-pending mode, selects the newest record matching ITERM_SESSION_ID, and
+prints it before the shell renders its prompt.
 
 Usage:
   pi_iterm2_daemon.py              Run as the long-lived daemon (AutoLaunch).
   pi_iterm2_daemon.py --check      One-shot: print what is currently recorded
-                                    for a session and the exact line that would
-                                    be injected on restore, without injecting
-                                    anything. Targets the session this is run
+                                    for a session and a reminder preview,
+                                    without delivering anything. Targets the
+                                    session this is run
                                     from (via the ITERM_SESSION_ID environment
                                     variable iTerm2 sets), or pass
                                     --session <id> to check a specific one.
-  pi_iterm2_daemon.py --check-all  The same report for every live session --
-                                    all panes of all tabs of all windows, plus
-                                    buried sessions -- marking the tab it was
-                                    run from, and summarizing how many stored
-                                    records belong to tabs that no longer
-                                    exist. Needs no ITERM_SESSION_ID.
+  pi_iterm2_daemon.py --check-all  Preview every stored tab record. Needs no
+                                    ITERM_SESSION_ID.
+
+The installed shell hook uses the hidden --emit-pending mode to print one
+matching reminder synchronously before the first prompt.
 """
 
 import argparse
 import asyncio
 import fcntl
 import json
+import math
 import os
 import re
+import shlex
+import socket
+import subprocess
 import sys
+import termios
 import time
+import tty
+import unicodedata
+import uuid
 from pathlib import Path
 from typing import Optional
 
-import iterm2
+iterm2 = None
+
+
+def require_iterm2():
+    """Load the heavy iTerm2 SDK only in long-lived daemon mode."""
+    global iterm2
+    if iterm2 is None:
+        import importlib
+
+        iterm2 = importlib.import_module("iterm2")
+    return iterm2
+
 
 STATE_PATH = Path.home() / ".pi-iterm2" / "state.json"
-SOCKET_PATH = STATE_PATH.parent / "daemon.sock"
+PREVIOUS_STATE_PATH = STATE_PATH.parent / "state.previous.json"
 LOCK_PATH = STATE_PATH.parent / "daemon.lock"
-PROTOCOL_VERSION = 1
-MAX_REQUEST_BYTES = 16 * 1024
+RECORD_INDEX_PATH = STATE_PATH.parent / "record-ids"
+APP_RUN_MARKER = "user.pi_iterm2_app_run"
 HOST_COLOR_PATTERN = re.compile(r"#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})")
-
+ITERM_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+PI_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
+CONFIG_PATH = Path.home() / ".pi" / "agent" / "pi-iterm2.json"
+VSCODE_SETTINGS_PATHS = [
+    Path.home() / ".vscode-remote" / "data" / "Machine" / "settings.json",
+    Path.home() / ".vscode-server" / "data" / "Machine" / "settings.json",
+]
+VSCODE_COLOR_KEYS = [
+    "titleBar.activeBackground",
+    "titleBar.inactiveBackground",
+    "activityBar.background",
+]
+IDLE_SATURATION = 45
+IDLE_LIGHTNESS = 30
 # Everything this daemon reports comes from iTerm2 session variables, and any process that
 # can write to a terminal can set those with OSC 1337;SetUserVar -- the payload is base64,
 # so arbitrary bytes, ESC included, survive into the variable intact. Those values get
@@ -84,18 +106,24 @@ HOST_COLOR_PATTERN = re.compile(r"#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{
 # name would otherwise be executed as escape sequences in a tab it was never typed in.
 # Strip control bytes at the boundary, the same way the extension's sanitizeOscText() does
 # before emitting a raw OSC payload.
-CONTROL_BYTES_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
+CONTROL_BYTES_PATTERN = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 # Also bound the length, so one very long value can't push the rest of a report off screen.
 MAX_FIELD_LENGTH = 256
 
 
 def sanitize_text(value: Optional[str], limit: int = MAX_FIELD_LENGTH) -> Optional[str]:
-    """Strip control bytes and cap the length. None and "" pass through unchanged, since
-    callers distinguish "unset" from "set to something"."""
+    """Strip controls and cap strings; reject every other value type."""
+    if not isinstance(value, str):
+        return None
     if not value:
         return value
-    return CONTROL_BYTES_PATTERN.sub("", value)[:limit]
+    value = CONTROL_BYTES_PATTERN.sub("", value)
+    return "".join(
+        character
+        for character in value
+        if unicodedata.category(character) not in {"Cf", "Cs", "Zl", "Zp"}
+    )[:limit]
 
 
 # Keep the most recently updated records only, so a long-lived install does not
@@ -103,38 +131,154 @@ def sanitize_text(value: Optional[str], limit: int = MAX_FIELD_LENGTH) -> Option
 MAX_RECORDS = 200
 
 
-def load_state() -> dict:
+def record_timestamp(record: dict) -> float:
+    value = record.get("updatedAt")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
     try:
-        return json.loads(STATE_PATH.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
+        return float(value) if math.isfinite(value) else 0
+    except OverflowError:
+        return 0
+
+
+def load_state(path: Optional[Path] = None, strict: bool = False) -> dict:
+    target = path or STATE_PATH
+    try:
+        state = json.loads(target.read_text())
+    except FileNotFoundError:
         return {}
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        if strict:
+            raise
+        return {}
+    if not isinstance(state, dict) or any(
+        not isinstance(key, str) or not isinstance(record, dict)
+        for key, record in state.items()
+    ):
+        if strict:
+            raise ValueError(f"Invalid state structure in {target}.")
+        return (
+            {
+                key: record
+                for key, record in state.items()
+                if isinstance(key, str) and isinstance(record, dict)
+            }
+            if isinstance(state, dict)
+            else {}
+        )
+    return state
+
+
+def load_report_state() -> dict:
+    """Return records from both launches, preferring the current launch."""
+    state = load_state(PREVIOUS_STATE_PATH)
+    state.update(load_state())
+    return state
+
+
+def sync_record_index() -> None:
+    """Publish record IDs for the shell hook's zero-process fast path."""
+    STATE_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STATE_PATH.parent, 0o700)
+    session_ids = sorted(
+        session_id
+        for session_id in load_state(PREVIOUS_STATE_PATH)
+        if isinstance(session_id, str)
+        and ITERM_SESSION_ID_PATTERN.fullmatch(session_id)
+    )
+    contents = "".join(f"{session_id}\n" for session_id in session_ids)
+    try:
+        if RECORD_INDEX_PATH.read_text() == contents:
+            return
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        pass
+    tmp = RECORD_INDEX_PATH.with_name(
+        f"{RECORD_INDEX_PATH.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        tmp.write_text(contents)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, RECORD_INDEX_PATH)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def limit_state(state: dict) -> dict:
+    if len(state) <= MAX_RECORDS:
+        return state
+    newest = sorted(
+        state.items(), key=lambda item: record_timestamp(item[1]), reverse=True
+    )
+    return dict(newest[:MAX_RECORDS])
+
+
+def write_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(limit_state(state), indent=2, sort_keys=True))
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def rotate_state_for_new_app_run() -> None:
+    """Merge completed state into the durable recovery snapshot."""
+    prepare_state_directory()
+    if not STATE_PATH.exists():
+        return
+    current = load_state(STATE_PATH, strict=True)
+    merged = load_state(PREVIOUS_STATE_PATH, strict=True)
+    for session_id, record in current.items():
+        previous = merged.get(session_id)
+        if previous is None or record_timestamp(record) >= record_timestamp(previous):
+            merged[session_id] = record
+    write_state(PREVIOUS_STATE_PATH, merged)
+    STATE_PATH.unlink()
+
+
+async def prepare_recovery_state(app) -> dict:
+    """Rotate state once per iTerm2 application launch and return its snapshot.
+
+    Session-scoped user variables survive window restoration, so they cannot tell
+    a restored, dead Pi from a live one. The application-scoped run id does not
+    survive an iTerm2 restart but does survive a daemon restart within the same app.
+    """
+    app_run_id = await app.async_get_variable(APP_RUN_MARKER)
+    if not isinstance(app_run_id, str) or not app_run_id:
+        rotate_state_for_new_app_run()
+        app_run_id = uuid.uuid4().hex
+        await app.async_set_variable(APP_RUN_MARKER, app_run_id)
+    sync_record_index()
+    return load_state(PREVIOUS_STATE_PATH)
 
 
 def save_state(state: dict) -> None:
-    """Write via a temp file and atomic replace. A plain truncate-and-write would leave
-    invalid JSON behind if iTerm2 quit mid-write -- the very event this feature exists to
-    survive -- and load_state() treats invalid JSON as empty, silently losing everything.
-    """
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if len(state) > MAX_RECORDS:
-        newest = sorted(
-            state.items(), key=lambda kv: kv[1].get("updatedAt", 0), reverse=True
-        )
-        state = dict(newest[:MAX_RECORDS])
-    tmp = STATE_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
-    os.replace(tmp, STATE_PATH)
+    """Atomically persist the current app run."""
+    write_state(STATE_PATH, state)
 
 
 def record_session(session_id: str, values: dict) -> None:
     """Read-modify-write in one synchronous step. Keeping this free of `await` is what
     stops two tabs' tasks from interleaving between the load and the save and dropping
     one another's records."""
-    state = load_state()
+    state = load_state(strict=True)
     state[session_id] = {
         "hostname": values["hostname"],
+        "username": values["username"],
         "cwd": values["cwd"],
-        "piSessionId": values["pi_session"],
+        "piSessionId": values["pi_session_id"],
+        "piSessionIdExact": True,
+        "piSessionName": values["pi_session"],
+        "piInstance": values["pi_instance"],
         "status": values["pi_status"],
         "hostColor": values["host_color"],
         "updatedAt": time.time(),
@@ -143,6 +287,9 @@ def record_session(session_id: str, values: dict) -> None:
 
 
 def format_ago(seconds: float) -> str:
+    if not isinstance(seconds, (int, float)) or not math.isfinite(seconds):
+        seconds = 0
+    seconds = max(0, seconds)
     if seconds < 60:
         return f"{int(seconds)}s"
     if seconds < 3600:
@@ -165,38 +312,303 @@ def colored_hostname(host, color, dim_context=False) -> str:
     return f"\x1b[38;2;{red};{green};{blue}m{host}\x1b[39m"
 
 
-def build_reminder_line(prior: Optional[dict]) -> Optional[str]:
-    """The single source of truth for what gets replayed into a restored tab. Returns None
-    when there is no record to report. Used both to inject the real reminder and, in
-    --check mode, to preview it without injecting anything."""
-    if not prior:
+def is_pi_session_id(value: Optional[str], exact: bool = False) -> bool:
+    """Validate an exact Pi ID, or conservatively accept only a UUID."""
+    if not value:
+        return False
+    if exact:
+        return PI_SESSION_ID_PATTERN.fullmatch(value) is not None
+    try:
+        return str(uuid.UUID(value)) == value.lower()
+    except ValueError:
+        return False
+
+
+def is_local_hostname(
+    host: Optional[str], local_hostname: Optional[str] = None
+) -> bool:
+    """Match exact local hostname aliases plus the standard loopback hostnames."""
+    if not host:
+        return False
+    normalized = host.rstrip(".").lower()
+    if normalized in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    if local_hostname is not None:
+        aliases = {local_hostname}
+    else:
+        aliases = {socket.gethostname(), socket.getfqdn()}
+    return normalized in {alias.rstrip(".").lower() for alias in aliases if alias}
+
+
+def fnv1a(text: str) -> int:
+    hashed = 0x811C9DC5
+    for character in text:
+        hashed = ((hashed ^ ord(character)) * 0x01000193) & 0xFFFFFFFF
+    return hashed
+
+
+def rgb_to_hue(red: int, green: int, blue: int) -> float:
+    red, green, blue = red / 255, green / 255, blue / 255
+    largest = max(red, green, blue)
+    delta = largest - min(red, green, blue)
+    if delta == 0:
+        return 0
+    if largest == red:
+        sextant = ((green - blue) / delta) % 6
+    elif largest == green:
+        sextant = (blue - red) / delta + 2
+    else:
+        sextant = (red - green) / delta + 4
+    return (sextant * 60) % 360
+
+
+def hue_from_css_hex(value: str) -> Optional[float]:
+    match = re.fullmatch(r"#([0-9a-fA-F]{3,8})", value.strip())
+    if match is None:
         return None
-    ago = format_ago(time.time() - prior.get("updatedAt", time.time()))
-    # Sanitized again on the way out, not just on the way in: a state file written by an
-    # older build, or edited by hand, is replayed straight into a terminal from here.
+    digits = match.group(1)
+    if len(digits) in (3, 4):
+        digits = "".join(digit * 2 for digit in digits[:3])
+    elif len(digits) in (6, 8):
+        digits = digits[:6]
+    else:
+        return None
+    return rgb_to_hue(int(digits[0:2], 16), int(digits[2:4], 16), int(digits[4:6], 16))
+
+
+def parse_color_spec(value) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value % 360
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    match = re.fullmatch(r"#?([0-9a-fA-F]{6})", text)
+    if match is not None:
+        digits = match.group(1)
+        return rgb_to_hue(
+            int(digits[0:2], 16), int(digits[2:4], 16), int(digits[4:6], 16)
+        )
+    if re.fullmatch(r"[+-]?\d+(\.\d+)?", text):
+        return float(text) % 360
+    return None
+
+
+def hsl_to_rgb(hue: float, saturation: float, lightness: float) -> tuple[int, int, int]:
+    saturation, lightness = saturation / 100, lightness / 100
+    chroma = (1 - abs(2 * lightness - 1)) * saturation
+    sextant = (hue % 360) / 60
+    second = chroma * (1 - abs((sextant % 2) - 1))
+    base = lightness - chroma / 2
+    order = [
+        (chroma, second, 0),
+        (second, chroma, 0),
+        (0, chroma, second),
+        (0, second, chroma),
+        (second, 0, chroma),
+        (chroma, 0, second),
+    ]
+    return tuple(
+        math.floor((channel + base) * 255 + 0.5)
+        for channel in order[min(int(sextant), 5)]
+    )
+
+
+def read_json(path: Path):
+    try:
+        value = json.loads(path.read_text())
+        return value
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def vscode_hue() -> Optional[tuple[float, str]]:
+    for path in VSCODE_SETTINGS_PATHS:
+        settings = read_json(path)
+        if not isinstance(settings, dict):
+            continue
+        colors = settings.get("workbench.colorCustomizations")
+        if not isinstance(colors, dict):
+            continue
+        for key in VSCODE_COLOR_KEYS:
+            value = colors.get(key)
+            if isinstance(value, str):
+                hue = hue_from_css_hex(value)
+                if hue is not None:
+                    return hue, f"{key} in {path}"
+    return None
+
+
+def resolve_shell_hue(host: str, config: dict) -> tuple[float, str]:
+    host_colors = config.get("hostColors")
+    pinned = (
+        parse_color_spec(host_colors.get(host))
+        if isinstance(host_colors, dict)
+        else None
+    )
+    if pinned is not None:
+        return pinned, "hostColors pin"
+    if config.get("vscodeColor", True):
+        found = vscode_hue()
+        if found is not None:
+            return found[0], f"VS Code window color ({found[1]})"
+    palette_value = config.get("palette")
+    palette = [
+        hue
+        for hue in (
+            parse_color_spec(entry)
+            for entry in (palette_value if isinstance(palette_value, list) else [])
+        )
+        if hue is not None
+    ]
+    if palette:
+        return palette[fnv1a(f"host:{host}") % len(palette)], "palette"
+    return float(fnv1a(f"host:{host}") % 360), "hostname hash"
+
+
+def shell_identity_output(check: bool = False) -> int:
+    host = os.uname().nodename
+    config_value = read_json(CONFIG_PATH)
+    config = config_value if isinstance(config_value, dict) else {}
+    disabled = None
+    if config.get("enabled") is False:
+        disabled = f"enabled is false in {CONFIG_PATH}"
+    elif config.get("tabColor") is False:
+        disabled = f"tabColor is false in {CONFIG_PATH}"
+    if disabled:
+        if check:
+            print(f"host:     {host}")
+            print(f"disabled: {disabled}")
+        return 0
+
+    hue, source = resolve_shell_hue(host, config)
+    rgb = hsl_to_rgb(hue, IDLE_SATURATION, IDLE_LIGHTNESS)
+    sequence = "".join(
+        f"\x1b]6;1;bg;{name};brightness;{value}\x07"
+        for name, value in (("red", rgb[0]), ("green", rgb[1]), ("blue", rgb[2]))
+    )
+    if os.environ.get("TMUX"):
+        sequence = "\x1bPtmux;" + sequence.replace("\x1b", "\x1b\x1b") + "\x1b\\"
+    if check:
+        colored_host = f"\x1b[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m{host}\x1b[39m"
+        print(f"host:   {colored_host}")
+        print(f"hue:    {hue:.1f} deg")
+        print(f"source: {source}")
+        print(
+            f"color:  rgb({rgb[0]},{rgb[1]},{rgb[2]})  "
+            f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+        )
+        return 0
+    sys.stdout.write(sequence)
+    sys.stdout.flush()
+    return 0
+
+
+def build_remote_launch_argv(
+    host: str, user: Optional[str], remote_command: str
+) -> list[str]:
+    """Argv that runs remote_command on a remote host, for the resume command.
+
+    Override this when a deployment reaches hosts with something other than plain
+    SSH. The replacement owns the whole argv, so it also fits launchers that take
+    the remote command through a flag, that put the host last, or that address
+    hosts by name without a username.
+    """
+    target = f"{user}@{host}" if user else host
+    return ["ssh", "-t", "--", target, remote_command]
+
+
+def build_resume_command(
+    prior: Optional[dict], local_hostname: Optional[str] = None
+) -> Optional[str]:
+    """Build a shell-safe, copyable local or SSH command for resuming Pi."""
+    if not isinstance(prior, dict) or not prior:
+        return None
+    host = sanitize_text(prior.get("hostname"))
+    user = sanitize_text(prior.get("username"))
+    cwd = sanitize_text(prior.get("cwd"))
+    pi_session_id = sanitize_text(prior.get("piSessionId"))
+    if not host or not cwd:
+        return None
+    resume_command = f"cd -- {shlex.quote(cwd)}"
+    has_pi_session = is_pi_session_id(
+        pi_session_id, exact=prior.get("piSessionIdExact") is True
+    )
+    local = is_local_hostname(host, local_hostname)
+    if local and not has_pi_session:
+        return None  # iTerm2 restores a local shell's directory itself.
+    if has_pi_session:
+        resume_command += f" && exec pi --session {shlex.quote(pi_session_id)}"
+    if local:
+        return resume_command
+    if not has_pi_session:
+        resume_command += ' && exec "${SHELL:-/bin/sh}" -l'
+    return shlex.join(build_remote_launch_argv(host, user or None, resume_command))
+
+
+def build_reminder_line(
+    prior: Optional[dict], local_hostname: Optional[str] = None
+) -> Optional[str]:
+    """The single source of truth for shell-hook output and check previews."""
+    if not isinstance(prior, dict) or not prior:
+        return None
+    updated_at = record_timestamp(prior)
+    age = time.time() - updated_at if updated_at else 0
+    ago = format_ago(age)
+    # Treat persisted state as untrusted because it is rendered directly in a terminal.
     host = sanitize_text(prior.get("hostname"))
     cwd = sanitize_text(prior.get("cwd")) or "?"
-    pi_session_id = sanitize_text(prior.get("piSessionId")) or "?"
+    pi_session_id = sanitize_text(prior.get("piSessionId"))
+    pi_session_name = sanitize_text(prior.get("piSessionName"))
+    has_pi_session = is_pi_session_id(
+        pi_session_id, exact=prior.get("piSessionIdExact") is True
+    )
+    session_label = pi_session_name or pi_session_id or "?"
     status = sanitize_text(prior.get("status")) or "?"
     # hostname is only populated when the extension's `currentDir` option is on, so the
     # location half of the line degrades to just the cwd rather than printing "?".
     display_host = colored_hostname(host, prior.get("hostColor"), dim_context=True)
     where = f"{display_host} {cwd}" if host else cwd
+    if has_pi_session:
+        reminder = (
+            f"\x1b[2mLast Pi session in this tab was "
+            f"{session_label} ({status}) "
+            f"on {where}, {ago} ago.\x1b[0m\n"
+        )
+        restore_target = "session"
+    else:
+        reminder = (
+            f"\x1b[2mLast shell location in this tab was "
+            f"{where}, {ago} ago.\x1b[0m\n"
+        )
+        restore_target = "shell"
+    command = build_resume_command(prior, local_hostname)
+    if not command:
+        return reminder + "\n"
+    # Bold the command instead of printing literal Markdown backticks. Terminal copy
+    # omits the styling escapes, leaving the command itself safe to paste.
     return (
-        f"\r\n\x1b[2mpi-iterm2: last session in this tab was "
-        f"{pi_session_id} ({status}) "
-        f"on {where}, {ago} ago\x1b[0m\r\n"
+        reminder + f"Run \x1b[1m{command}\x1b[22m to restore this {restore_target}.\n\n"
     )
 
 
 async def read_session_vars(session) -> dict:
-    """Sanitized at this boundary, so nothing downstream -- the state file, the reports, the
-    injected reminder -- ever handles a value with control bytes in it."""
+    """Sanitized at this boundary, so state, reports, and hook output stay safe."""
+    pi_cwd = sanitize_text(await session.async_get_variable("user.pi_cwd"))
+    shell_cwd = sanitize_text(await session.async_get_variable("path"))
     return {
         "hostname": sanitize_text(await session.async_get_variable("hostname")),
-        "cwd": sanitize_text(await session.async_get_variable("user.pi_cwd")),
+        "username": sanitize_text(await session.async_get_variable("username")),
+        "cwd": pi_cwd or shell_cwd,
         "pi_session": sanitize_text(
             await session.async_get_variable("user.pi_session")
+        ),
+        "pi_session_id": sanitize_text(
+            await session.async_get_variable("user.pi_session_id")
+        ),
+        "pi_instance": sanitize_text(
+            await session.async_get_variable("user.pi_instance")
         ),
         "pi_status": sanitize_text(await session.async_get_variable("user.pi_status")),
         # Validated by HOST_COLOR_PATTERN before use, but sanitizing is free and keeps the
@@ -207,45 +619,141 @@ async def read_session_vars(session) -> dict:
     }
 
 
-async def replay_into_tab(session, session_id: str) -> None:
-    """Inject the reminder for a tab that just appeared, if it has a prior record and no
-    pi session live in it right now."""
-    prior = load_state().get(session_id)
-    line = build_reminder_line(prior)
-    if not line:
-        return
-    if await session.async_get_variable("user.pi_session"):
-        return  # pi is already running here; injecting would land in its TUI
-    await session.async_inject(line.encode("utf-8"))
+def latest_record_for_session(session_id: Optional[str]) -> Optional[dict]:
+    """Return the newest record for a tab, before or after startup rotation."""
+    resolved_id = resolve_session_id(session_id)
+    if not resolved_id:
+        return None
+    records = [
+        state[resolved_id]
+        for state in (load_state(), load_state(PREVIOUS_STATE_PATH))
+        if isinstance(state, dict) and isinstance(state.get(resolved_id), dict)
+    ]
+    if not records:
+        return None
+    return max(records, key=record_timestamp)
 
 
-async def track_session(connection, session_id):
+def read_single_key(prompt: str) -> str:
+    """Read one unechoed key from the terminal without waiting for Enter."""
+    descriptor = sys.stdin.fileno()
+    previous = termios.tcgetattr(descriptor)
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    try:
+        tty.setcbreak(descriptor)
+        return sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+def maybe_run_restore(
+    prior: Optional[dict], input_fn=None, run_fn=subprocess.run, tty_check=None
+) -> bool:
+    """Optionally run the displayed command after an explicit default-no prompt."""
+    if tty_check is None:
+        tty_check = lambda: sys.stdin.isatty() and sys.stdout.isatty()
+    if not tty_check():
+        return False
+    config = read_json(CONFIG_PATH)
+    if not isinstance(config, dict) or config.get("promptRestore") is not True:
+        return False
+    command = build_resume_command(prior)
+    if not command:
+        return False
+    try:
+        answer = (
+            input_fn("Run it now? [y/N] ")
+            if input_fn is not None
+            else read_single_key("Run it now? [y/N] ")
+        )
+    except (EOFError, KeyboardInterrupt, OSError, termios.error):
+        return False
+    if answer.lower() != "y":
+        return False
+    shell = os.environ.get("SHELL") or "/bin/sh"
+    environment = os.environ.copy()
+    if os.environ.get("ITERM_SESSION_ID"):
+        environment["PI_ITERM2_RESTORE_SESSION_ID"] = os.environ["ITERM_SESSION_ID"]
+    run_fn([shell, "-lic", command], check=False, env=environment)
+    return True
+
+
+def emit_pending_replay() -> int:
+    """Print one reminder synchronously from a shell pre-prompt hook."""
+    try:
+        prior = latest_record_for_session(os.environ.get("ITERM_SESSION_ID"))
+        output = build_reminder_line(prior)
+        if not output:
+            return 3
+        try:
+            sys.stdout.write(output)
+        except UnicodeEncodeError:
+            sys.stdout.buffer.write(output.encode("utf-8", errors="replace"))
+        sys.stdout.flush()
+        maybe_run_restore(prior)
+        return 0
+    except (OSError, TypeError, ValueError, UnicodeError):
+        return 1
+
+
+async def track_session(connection, session_id, recovery_state: dict):
+    """Record Pi identity changes; shell hooks handle all reminder output."""
     app = await iterm2.async_get_app(connection)
-
     session = app.get_session_by_id(session_id)
     if session is None:
         return
-    await replay_into_tab(session, session_id)
 
-    # pi_cwd is set at session start (and on rename), so this fires exactly when there is
-    # something new worth recording -- no polling. Note the recording side only needs
-    # pi_cwd/pi_session, which the extension's `userVars` option controls; `hostname`
-    # comes from its separate `currentDir` option and is treated as optional so turning
-    # that off does not silently stop the daemon recording anything.
-    async with iterm2.VariableMonitor(
-        connection, iterm2.VariableScopes.SESSION, "user.pi_cwd", session_id
-    ) as mon:
-        while True:
-            await mon.async_get()
-
-            session = app.get_session_by_id(session_id)
-            if session is None:
-                return  # session ended
-
-            values = await read_session_vars(session)
-            if not values["cwd"]:
-                continue
+    async with (
+        iterm2.VariableMonitor(
+            connection, iterm2.VariableScopes.SESSION, "user.pi_cwd", session_id
+        ) as cwd_monitor,
+        iterm2.VariableMonitor(
+            connection, iterm2.VariableScopes.SESSION, "path", session_id
+        ) as path_monitor,
+        iterm2.VariableMonitor(
+            connection, iterm2.VariableScopes.SESSION, "user.pi_instance", session_id
+        ) as instance_monitor,
+        iterm2.VariableMonitor(
+            connection, iterm2.VariableScopes.SESSION, "user.pi_status", session_id
+        ) as status_monitor,
+    ):
+        values = await read_session_vars(session)
+        prior = recovery_state.get(session_id)
+        if values["cwd"] and (
+            not prior
+            or (
+                values["pi_instance"]
+                and values["pi_instance"] != prior.get("piInstance")
+            )
+        ):
             record_session(session_id, values)
+
+        async def record_on_change(monitor):
+            while True:
+                await monitor.async_get()
+                current_session = app.get_session_by_id(session_id)
+                if current_session is None:
+                    return
+                current_values = await read_session_vars(current_session)
+                if current_values["cwd"]:
+                    record_session(session_id, current_values)
+
+        tasks = [
+            asyncio.create_task(record_on_change(cwd_monitor)),
+            asyncio.create_task(record_on_change(path_monitor)),
+            asyncio.create_task(record_on_change(instance_monitor)),
+            asyncio.create_task(record_on_change(status_monitor)),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def resolve_session_id(value: Optional[str]) -> Optional[str]:
@@ -253,233 +761,60 @@ def resolve_session_id(value: Optional[str]) -> Optional[str]:
     return value.rsplit(":", 1)[-1] if value else None
 
 
-def format_session_report(
-    session_id: str, values: dict, prior: Optional[dict], marker: str = ""
+def format_record_report(
+    session_id: str, record: Optional[dict], current: bool = False
 ) -> str:
-    """One session's live variables, stored record, and what would be injected. Shared by
-    --check, --check-all, and local IPC so the three can never drift apart."""
+    marker = (
+        "  <- this tab"
+        if session_id == resolve_session_id(os.environ.get("ITERM_SESSION_ID"))
+        else ""
+    )
     lines = [
         f"session id: {session_id}{marker}",
-        "hostname:   "
-        + (
-            colored_hostname(values["hostname"], values.get("host_color"))
-            if values["hostname"]
-            else "(unset)"
-        ),
-        f"cwd:        {values['cwd'] or '(unset)'}",
-        f"pi_session: {values['pi_session'] or '(unset)'}",
-        f"pi_status:  {values['pi_status'] or '(unset)'}",
-        "",
-        "stored record: " + (json.dumps(prior, indent=2) if prior else "(none)"),
+        f"stored record{' (current)' if current else ''}: "
+        + (json.dumps(record, indent=2) if record else "(none)"),
         "",
     ]
-
-    line = build_reminder_line(prior)
-    if not line:
-        lines.append(
-            "Would inject on restore: nothing (no record stored for this tab yet)"
-        )
-        return "\n".join(lines)
-    lines.extend(["Would inject on restore:", line.strip("\r\n")])
-    if values["pi_session"]:
-        lines.extend(
-            [
-                "",
-                "Note: suppressed while pi is live in this tab. The reminder is injected only",
-                "when a tab appears with no pi session running, so it cannot land in pi's TUI.",
-            ]
-        )
-    return "\n".join(lines)
-
-
-def format_session_line(
-    session_id: str, values: dict, marker: str = "", width: int = 0
-) -> str:
-    """A tab with no stored record has nothing to preview, so --check-all summarizes it in
-    one line -- still showing whether pi is live in it -- rather than repeating a full
-    empty report per tab."""
-    bits = []
-    if values["hostname"]:
-        bits.append(
-            "host=" + colored_hostname(values["hostname"], values.get("host_color"))
-        )
-    bits.extend(
-        f"{key}={values[key]}"
-        for key in ("cwd", "pi_session", "pi_status")
-        if values[key]
-    )
-    label = f"{session_id}{marker}".ljust(width)
-    return f"  {label}  {'  '.join(bits) if bits else '(no pi variables set)'}"
-
-
-def all_sessions(app) -> list:
-    """Every live session: all panes of all tabs of all windows, including panes minimized
-    behind a maximized one, plus buried sessions (which live outside the window tree).
-    """
-    sessions = []
-    for window in app.windows:
-        for tab in window.tabs:
-            sessions.extend(tab.all_sessions)
-    sessions.extend(app.buried_sessions)
-    return sessions
-
-
-async def build_check_report(connection, session_id: Optional[str]) -> str:
-    app = await iterm2.async_get_app(connection)
-    resolved_id = resolve_session_id(session_id)
-    if not resolved_id:
-        raise ValueError(
-            "No session id given and ITERM_SESSION_ID is not set. Run this from inside "
-            "an iTerm2 tab, or pass --session <id>, or use --check-all."
-        )
-
-    session = app.get_session_by_id(resolved_id)
-    if session is None:
-        raise ValueError(f"No live session with id {resolved_id}.")
-
-    values = await read_session_vars(session)
-    return format_session_report(resolved_id, values, load_state().get(resolved_id))
-
-
-async def check_main(connection, session_id: Optional[str]):
-    try:
-        print(
-            await build_check_report(
-                connection, session_id or os.environ.get("ITERM_SESSION_ID")
-            )
-        )
-    except ValueError as error:
-        print(error, file=sys.stderr)
-
-
-async def build_check_all_report(
-    connection, current_session_id: Optional[str] = None
-) -> str:
-    app = await iterm2.async_get_app(connection)
-    sessions = all_sessions(app)
-    if not sessions:
-        return "No live iTerm2 sessions."
-
-    current_id = resolve_session_id(current_session_id)
-    state = load_state()
-
-    recorded, unrecorded = [], []
-    for session in sessions:
-        session_id = session.session_id
-        entry = (
-            session_id,
-            await read_session_vars(session),
-            "  <- this tab" if session_id == current_id else "",
-        )
-        (recorded if state.get(session_id) else unrecorded).append(entry)
-
-    lines = []
-    if recorded:
-        lines.append(f"Tabs with a stored record ({len(recorded)}):\n")
-        for index, (session_id, values, marker) in enumerate(recorded):
-            if index:
-                lines.append("\n" + "-" * 72 + "\n")
-            lines.append(
-                format_session_report(session_id, values, state.get(session_id), marker)
-            )
-        lines.append("")
-
-    if unrecorded:
-        lines.append(f"Tabs with no stored record ({len(unrecorded)}):")
-        width = max(
-            len(f"{session_id}{marker}") for session_id, _, marker in unrecorded
-        )
-        for session_id, values, marker in unrecorded:
-            lines.append(format_session_line(session_id, values, marker, width))
-        lines.append("")
-
-    orphans = [key for key in state if key not in {s.session_id for s in sessions}]
+    reminder = build_reminder_line(record)
     lines.extend(
         [
-            "=" * 72,
-            f"{len(sessions)} live session(s); {len(state)} stored record(s), {len(orphans)} for tabs that no longer exist.",
+            "Reminder preview:",
+            reminder.strip("\n") if reminder else "nothing stored for this tab",
         ]
     )
     return "\n".join(lines)
 
 
-async def check_all_main(connection):
-    print(await build_check_all_report(connection, os.environ.get("ITERM_SESSION_ID")))
+def build_check_report(session_id: Optional[str]) -> str:
+    resolved_id = resolve_session_id(session_id)
+    if not resolved_id:
+        raise ValueError(
+            "No session id given and ITERM_SESSION_ID is not set. Use --session <id>."
+        )
+    current = load_state()
+    previous = load_state(PREVIOUS_STATE_PATH)
+    record = current.get(resolved_id) or previous.get(resolved_id)
+    return format_record_report(resolved_id, record, current=resolved_id in current)
 
 
-def parse_control_request(line: bytes) -> tuple[Optional[str], Optional[str]]:
-    """Validate one request line and return its (command, session id). Raises ValueError
-    with a client-facing message for anything malformed; nothing here trusts the caller,
-    since any process running as this user can reach the socket."""
-    if not line or len(line) > MAX_REQUEST_BYTES or not line.endswith(b"\n"):
-        raise ValueError("Invalid or oversized daemon request.")
-    request = json.loads(line)
-    if not isinstance(request, dict):
-        raise ValueError("Daemon request must be a JSON object.")
-    # An exact type check, not isinstance: bool subclasses int, so True would otherwise
-    # read as version 1.
-    version = request.get("version")
-    if type(version) is not int or version != PROTOCOL_VERSION:
-        raise ValueError("Incompatible daemon protocol version.")
-    session_id = request.get("sessionId")
-    if session_id is not None and not isinstance(session_id, str):
-        raise ValueError("sessionId must be a string.")
-    return request.get("command"), session_id
-
-
-async def run_control_command(connection, command, session_id: Optional[str]) -> str:
-    """The whole command surface: two read-only reports, and nothing else."""
-    if command == "check":
-        return await build_check_report(connection, session_id)
-    if command == "check-all":
-        return await build_check_all_report(connection, session_id)
-    raise ValueError("Unknown daemon command.")
-
-
-async def write_control_response(writer, response: dict) -> None:
-    """Best effort by design: a client that hung up mid-report is ordinary, and there is
-    nowhere useful to report a failure to reply to it."""
-    try:
-        writer.write((json.dumps(response) + "\n").encode("utf-8"))
-        await writer.drain()
-    # BrokenPipeError is a ConnectionError.
-    except ConnectionError:
-        pass
-    finally:
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except ConnectionError:
-            pass
-
-
-async def handle_control_request(reader, writer, connection, report_lock) -> None:
-    """Serve one bounded, read-only request over the user-owned local socket. Reads,
-    dispatches, and always answers: every failure below becomes an error field in the
-    response rather than a dropped connection."""
-    response = {"version": PROTOCOL_VERSION, "ok": False}
-    try:
-        line = await asyncio.wait_for(reader.readline(), timeout=5)
-        command, session_id = parse_control_request(line)
-
-        async def run_report():
-            async with report_lock:
-                return await run_control_command(connection, command, session_id)
-
-        # Include time waiting behind another report in the deadline, and leave a
-        # margin before the extension client's 15-second timeout.
-        output = await asyncio.wait_for(run_report(), timeout=14)
-        response = {"version": PROTOCOL_VERSION, "ok": True, "output": output}
-    except asyncio.TimeoutError:
-        response["error"] = "Timed out while handling daemon request."
-    # json.JSONDecodeError is a ValueError, so this covers a malformed request body as
-    # well as the explicit raises in parse_control_request.
-    except ValueError as error:
-        response["error"] = str(error) or "Invalid daemon request."
-    except Exception as error:
-        response["error"] = f"Could not query iTerm2: {error}"
-
-    await write_control_response(writer, response)
+def build_check_all_report() -> str:
+    current = load_state()
+    state = load_state(PREVIOUS_STATE_PATH)
+    state.update(current)
+    if not state:
+        return "No stored iTerm2 session records."
+    reports = [f"Stored records ({len(state)}):"]
+    for session_id in sorted(state):
+        reports.extend(
+            [
+                "",
+                "-" * 72,
+                format_record_report(
+                    session_id, state[session_id], current=session_id in current
+                ),
+            ]
+        )
+    return "\n".join(reports)
 
 
 def prepare_state_directory() -> None:
@@ -503,72 +838,38 @@ def acquire_daemon_lock(timeout: float = 5):
             time.sleep(0.1)
 
 
-async def start_control_server(connection, report_lock):
-    """Create the IPC socket. The caller must already hold the daemon lock."""
-    try:
-        SOCKET_PATH.unlink()
-    except FileNotFoundError:
-        pass
-
-    async def on_client(reader, writer):
-        await handle_control_request(reader, writer, connection, report_lock)
-
-    server = await asyncio.start_unix_server(
-        on_client,
-        path=SOCKET_PATH,
-        limit=MAX_REQUEST_BYTES + 1,
-    )
-    os.chmod(SOCKET_PATH, 0o600)
-    stat = SOCKET_PATH.stat()
-    return server, (stat.st_dev, stat.st_ino)
-
-
 async def daemon_main(connection):
     app = await iterm2.async_get_app(connection)
-    report_lock = asyncio.Lock()
-    try:
-        control = await start_control_server(connection, report_lock)
-    except Exception as error:
-        # Reporting is optional. A filesystem/socket problem must not disable the
-        # daemon's primary record-and-replay behavior.
-        print(f"Could not start pi-iterm2 check socket: {error}", file=sys.stderr)
-        control = None
+    recovery_state = await prepare_recovery_state(app)
 
     async def on_session(session_id):
         try:
-            await track_session(connection, session_id)
-        except Exception:
-            pass  # RPC failed for this session; stop watching it
+            await track_session(connection, session_id, recovery_state)
+        except Exception as error:
+            detail = sanitize_text(str(error)) or type(error).__name__
+            print(
+                f"Stopped tracking iTerm2 session {session_id}: {detail}",
+                file=sys.stderr,
+            )
 
-    try:
-        # Covers every session that exists now, plus every one created later. The
-        # framework cancels each task when its session terminates.
-        await iterm2.EachSessionOnceMonitor.async_foreach_session_create_task(
-            app, on_session
-        )
-    finally:
-        if control:
-            server, socket_identity = control
-            server.close()
-            await server.wait_closed()
-            try:
-                stat = SOCKET_PATH.stat()
-                if (stat.st_dev, stat.st_ino) == socket_identity:
-                    SOCKET_PATH.unlink()
-            except FileNotFoundError:
-                pass
+    # Covers every session that exists now, plus every one created later. The framework
+    # cancels each task when its session terminates.
+    await iterm2.EachSessionOnceMonitor.async_foreach_session_create_task(
+        app, on_session
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--check",
         action="store_true",
         help="Preview one session instead of running the daemon.",
     )
-    parser.add_argument(
+    mode.add_argument(
         "--check-all",
         action="store_true",
         help="Preview every live session instead of running the daemon.",
@@ -576,20 +877,50 @@ def main() -> None:
     parser.add_argument(
         "--session", help="Session id for --check (defaults to the current session)."
     )
+    mode.add_argument(
+        "--emit-pending",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    mode.add_argument(
+        "--refresh-record-index",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    mode.add_argument("--shell-identity", action="store_true", help=argparse.SUPPRESS)
+    mode.add_argument(
+        "--shell-identity-check", action="store_true", help=argparse.SUPPRESS
+    )
     args = parser.parse_args()
+    if args.session and not args.check:
+        parser.error("--session requires --check")
 
+    if args.emit_pending:
+        raise SystemExit(emit_pending_replay())
+    if args.refresh_record_index:
+        sync_record_index()
+        return
+    if args.shell_identity or args.shell_identity_check:
+        raise SystemExit(shell_identity_output(check=args.shell_identity_check))
     if args.check_all:
-        iterm2.run_until_complete(check_all_main)
-    elif args.check:
-        iterm2.run_until_complete(
-            lambda connection: check_main(connection, args.session)
-        )
-    else:
-        daemon_lock = acquire_daemon_lock()
-        if daemon_lock is None:
-            print("Another pi-iterm2 daemon is already running.", file=sys.stderr)
-            return
-        iterm2.run_forever(daemon_main)
+        print(build_check_all_report())
+        return
+    if args.check:
+        try:
+            print(
+                build_check_report(args.session or os.environ.get("ITERM_SESSION_ID"))
+            )
+        except ValueError as error:
+            print(f"Check failed: {sanitize_text(str(error))}", file=sys.stderr)
+            raise SystemExit(1) from error
+        return
+
+    require_iterm2()
+    daemon_lock = acquire_daemon_lock()
+    if daemon_lock is None:
+        print("Another pi-iterm2 daemon is already running.", file=sys.stderr)
+        return
+    iterm2.run_forever(daemon_main)
 
 
 if __name__ == "__main__":

@@ -3,16 +3,17 @@
 **Never lose a Pi session after an iTerm2 or system restart.** The macOS companion daemon remembers the remote host, working directory, and Pi session ID for every tab. When iTerm2 restores a tab, it prints exactly what was running there:
 
 ```text
-pi-iterm2: last session in this tab was 01abc... (idle) on devvm123 /home/me/project, 2m ago
+Last Pi session in this tab was 01abc... (idle) on devvm123 /home/me/project, 2m ago.
+Run ssh -t -- me@devvm123 'cd -- /home/me/project && exec pi --session 01abc...' to restore this session.
 ```
 
-The hostname is printed in that host's tab color, so it remains recognizable at a glance. The message tells you which host to reconnect to, which working directory to enter, and which exact Pi session to resume. Recovery is independent of SSH, mosh, devserver tooling, or any other connection method because pi-iterm2 records the session identity in the tab itself rather than managing the connection.
+The hostname is printed in that host's tab color, so it remains recognizable at a glance. The message tells you which host to reconnect to, which working directory to enter, and which exact Pi session to resume, followed by a shell-quoted command ready to copy and paste. Remote tabs without a Pi session get a command that reconnects and changes to their last directory; local shell tabs need no command because iTerm2 restores their cwd itself. The command is shown in bold without literal backticks, so copying it cannot accidentally invoke shell command substitution. The shell integration reads the newest matching state record while the shell rc file is sourced and prints it before Powerlevel10k's instant-prompt preamble, making it normal selectable startup output. Remote sessions are launched through `build_remote_launch_argv` (`ssh -t --` by default), so a deployment can override that function for another launcher. Recovery is independent of SSH, mosh, devserver tooling, or any other connection method because pi-iterm2 records session identity rather than managing the connection.
 
 The extension also ties iTerm2 tabs to the live Pi sessions running in them:
 
 - **Tab color** is derived from hostname (primary), session id (secondary nudge), and live agent status (idle/working/waiting/error) — so tabs on different machines are visually distinct, sessions on the same machine stay in the same color family, and a glance at the tab tells you whether that session needs attention.
 - **Tab title** gets a status icon prefixed while there's something to flag (working/waiting/error), on top of pi's own default title.
-- **cwd, session name, status, and resolved host color are published as iTerm2 user-defined variables** (`\(user.pi_cwd)`, `\(user.pi_session)`, `\(user.pi_status)`, `\(user.pi_host_color)`), so the companion daemon and custom iTerm2 badges or titles can use them.
+- **cwd, session name and ID, status, resolved host color, and a per-Pi-instance token are published as iTerm2 user-defined variables** (`\(user.pi_cwd)`, `\(user.pi_session)`, `\(user.pi_session_id)`, `\(user.pi_status)`, `\(user.pi_host_color)`, `\(user.pi_instance)`), so the companion daemon and custom iTerm2 badges or titles can use them.
 - **Native cwd tracking** (`CurrentDir`/`RemoteHost`) is also enabled, so iTerm2's own directory-inheriting new-tab/split behavior and semantic history work for the session's project directory.
 
 ## Install
@@ -50,6 +51,7 @@ Defaults apply with no configuration file. Override in:
   "tabTitle": true,
   "currentDir": true,
   "userVars": true,
+  "promptRestore": false,
   "vscodeColor": true
 }
 ```
@@ -58,7 +60,8 @@ Defaults apply with no configuration file. Override in:
 - `tabColor` — color-code the tab background by host/session/status.
 - `tabTitle` — prefix a status icon on the tab title (see [How the tab title is chosen](#how-the-tab-title-is-chosen)).
 - `currentDir` — emit iTerm2's native `CurrentDir`/`RemoteHost` sequences.
-- `userVars` — publish `pi_cwd`, `pi_session`, `pi_status`, and `pi_host_color` as iTerm2 user-defined variables.
+- `userVars` — publish `pi_cwd`, `pi_session`, `pi_session_id`, `pi_status`, `pi_host_color`, and the internal `pi_instance` liveness token as iTerm2 user-defined variables.
+- `promptRestore` — after printing a restore command, ask `Run it now? [y/N]`; a single `y`/`Y` runs it immediately without Enter, and any other key declines (default `false`; `/iterm2-install` can enable it).
 - `vscodeColor` — take the host's hue from the VS Code window color when one is set for this machine (see [Matching the VS Code window color](#matching-the-vs-code-window-color)). Set it to `false` to ignore that and use the palette or hash instead.
 - `palette`, `hostColors`, `sessionHueSpread` — shape or override the automatic colors (see [Choosing your own colors](#choosing-your-own-colors)).
 
@@ -125,7 +128,7 @@ The title follows pi's own default format exactly: `π - session - cwd` once the
 | Status | Icon |
 |---|---|
 | idle | (none) |
-| working | ◐ ◓ ◑ ◒ (spins through all four, once a second) |
+| working | ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏ (Pi's Working spinner, 80ms per frame) |
 | waiting (needs your input) | ◆ |
 | error (most recent turn failed) | ✖ |
 
@@ -154,46 +157,11 @@ To ignore VS Code entirely, set `"vscodeColor": false` in `~/.pi/agent/pi-iterm2
 
 Note that a fully grey window color (some "black"/"charcoal" presets) has no hue at all and resolves to 0°, i.e. red. Pin the host with `/iterm2-color` if you'd rather have something else.
 
-## Coloring tabs that aren't running pi
+## Shell tabs without Pi
 
-The tab color is three ordinary escape sequences, so a plain shell prompt can set the same color pi would — useful when you keep shells open on several machines and only some of them are running pi. `shell/tab_color.py` prints the escape for the current host and nothing else:
+The installed shell integration treats ordinary shell tabs as the same recoverable tabs with optional Pi metadata. On the Mac it applies the host's resting identity color. On remote hosts it publishes `RemoteHost` and `CurrentDir` at each prompt using shell builtins, allowing the Mac recorder to store the remote host and cwd without Pi or Python. It uses the same `~/.pi/agent/pi-iterm2.json` precedence as Pi (`hostColors` → VS Code window color → `palette` → hostname hash).
 
-```bash
-python3 shell/tab_color.py            # print the escape sequence
-python3 shell/tab_color.py --check    # print what it resolved, and why
-```
-
-It reads the same `~/.pi/agent/pi-iterm2.json`, follows the same precedence (`hostColors` → VS Code window color → `palette` → hostname hash), uses the same hash and the same color math, and honors `enabled: false`, `tabColor: false` and `vscodeColor: false` — so one configuration covers both, and a shell tab and a pi tab on the same host are the exact same color. It only ever reads; it has no dependencies beyond the standard library, so it also works copied to a host on its own.
-
-### bash
-
-In `~/.bashrc`:
-
-```bash
-if [[ $- == *i* ]]; then
-  PI_ITERM2_TAB_COLOR=$(python3 ~/path/to/pi-iterm2/shell/tab_color.py 2>/dev/null)
-  pi_iterm2_tab_color() { printf %s "$PI_ITERM2_TAB_COLOR"; }
-  [[ $PROMPT_COMMAND == *pi_iterm2_tab_color* ]] || PROMPT_COMMAND="pi_iterm2_tab_color${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
-fi
-```
-
-### zsh
-
-Same idea in `~/.zshrc`, but zsh has no `PROMPT_COMMAND` — use a `precmd` hook:
-
-```zsh
-if [[ -o interactive ]]; then
-  PI_ITERM2_TAB_COLOR=$(python3 ~/path/to/pi-iterm2/shell/tab_color.py 2>/dev/null)
-  pi_iterm2_tab_color() { printf %s "$PI_ITERM2_TAB_COLOR" }
-  (( ${precmd_functions[(Ie)pi_iterm2_tab_color]} )) || precmd_functions+=(pi_iterm2_tab_color)
-fi
-```
-
-Both run the script **once per shell** and replay the captured escape from a prompt hook, so the per-prompt cost is a shell builtin rather than a Python start-up. Both are also safe to re-source: the guard keeps the hook from being registered twice.
-
-The prompt hook matters for more than the first prompt: pi resets the tab color to the profile default when a session ends, so re-emitting on each prompt is what restores the host color after you exit pi.
-
-Two limits worth knowing. A shell has no agent status, so this always emits the resting (idle) shade — the working/waiting/error brightness only happens while pi is running. And since `TERM_PROGRAM` isn't forwarded over SSH, the script can't detect iTerm2 and simply emits unconditionally; other terminals ignore these sequences, but if you also connect from a terminal where that isn't true, guard the snippet with a check of your own.
+After a restart, a tab with Pi metadata gets the exact `pi --session` resume command. A remote tab without a Pi session ID gets a command that reconnects, changes to the recorded directory, and opens an interactive login shell. A local shell tab needs no restore command because iTerm2 restores its cwd. Agent status brightness is naturally available only while Pi is running.
 
 ## tmux
 
@@ -201,9 +169,9 @@ Sequences are wrapped in tmux's DCS passthrough envelope (`ESC Ptmux; ... ESC \`
 
 ## Displaying host, cwd, and session id
 
-`pi_cwd`, `pi_session`, `pi_status`, and `pi_host_color` are ordinary iTerm2 user-defined variables, referenceable as `\(user.pi_cwd)` etc. `pi_cwd`, `pi_session`, and `pi_host_color` are set at session start and when their values change; `pi_status` tracks the live agent status (`idle`/`working`/`waiting`/`error`), updating at the same moments as the tab color. `pi_host_color` is the resolved resting host color as `#rrggbb`, before the per-session nudge and live-status brightness. All four are cleared on session shutdown.
+`pi_cwd`, `pi_session`, `pi_session_id`, `pi_status`, `pi_host_color`, and `pi_instance` are ordinary iTerm2 user-defined variables, referenceable as `\(user.pi_cwd)` etc. `pi_cwd`, `pi_session`, `pi_session_id`, `pi_host_color`, and `pi_instance` are set at session start and when their values change; `pi_status` tracks the live agent status (`idle`/`working`/`waiting`/`error`), updating at the same moments as the tab color. `pi_session` is the display name when one is set (otherwise the ID), while `pi_session_id` is always the immutable ID accepted by `pi --session`. `pi_host_color` is the resolved resting host color as `#rrggbb`, before the per-session nudge and live-status brightness. `pi_instance` is a random token used by the companion daemon to distinguish a freshly started Pi from session variables restored after a force quit. All six are cleared on session shutdown.
 
-For **cwd and host specifically, prefer iTerm2's built-in variables instead**: `\(session.path)` and `\(session.hostname)` are auto-populated from the same `CurrentDir`/`RemoteHost` sequences this extension already sends, so `pi_cwd` is redundant with `session.path`. (`session.hostname`/`session.username` normally require iTerm2's own shell-integration script to be installed on the remote host — this extension's `RemoteHost` sequence populates them without that.) `pi_session` (the session id) has no iTerm2 built-in equivalent, since iTerm2 has no concept of it.
+For **cwd and host specifically, prefer iTerm2's built-in variables instead**: `\(session.path)` and `\(session.hostname)` are auto-populated from the same `CurrentDir`/`RemoteHost` sequences this extension already sends, so `pi_cwd` is redundant with `session.path`. (`session.hostname`/`session.username` normally require iTerm2's own shell-integration script to be installed on the remote host — this extension's `RemoteHost` sequence populates them without that.) `pi_session` and `pi_session_id` have no iTerm2 built-in equivalents, since iTerm2 has no concept of a Pi session.
 
 Put whichever combination you want in **Settings → Profiles → General → Badge**, a tab title format, or a status bar "Interpolated String" component, e.g.:
 ```
@@ -216,26 +184,36 @@ Note that none of badge/title/status-bar text is mouse-selectable (it's UI chrom
 
 ## macOS companion daemon
 
-`macos/pi_iterm2_daemon.py` is a standalone script that runs on the Mac, separately from the pi extension — it is not required for the tab color/user var/`CurrentDir` features above, which work without it. It records each tab's host, host color, `pi_cwd`, `pi_session`, and `pi_status` into `~/.pi-iterm2/state.json` (keyed by iTerm2 session id, capped at the 200 most recent), so that a tab restored after iTerm2, the local system, or the remote host restarts can say exactly where and how to resume its previous Pi session. The restored reminder and the `--check`/`--check-all` reports render each hostname in its recorded host color.
+`macos/pi_iterm2_daemon.py` is a standalone script that runs on the Mac, separately from the Pi extension. It records each tab's built-in host and path plus any Pi session metadata into `~/.pi-iterm2/state.json` (keyed by iTerm2 session id, capped at the 200 most recent), so restored Pi and ordinary shell tabs can show an appropriate resume command. The restored reminder and check reports render each hostname in its recorded host color.
 
-The reminder is injected **when the tab appears and no pi session is live in it** — i.e. while it's still showing a plain shell prompt — and deliberately not when pi later starts. `async_inject` delivers data as though it were program output, so injecting into a running pi TUI would land in a screen pi is actively repainting and be overwritten or corrupt it; a tab that already has a live pi session is skipped for the same reason.
+On a new iTerm2 application launch, the daemon merges completed `state.json` records into `state.previous.json` before recording the new launch. Records for tabs that were not resumed remain available across later restarts. Check reports combine both files, preferring a new record when the same tab has already been seen again and marking that record `(active)`; previous-only records are left unmarked.
+
+The reminder is printed while a newly launched restored shell sources its rc file, before Powerlevel10k's instant-prompt preamble. Ordinary tabs print nothing. The reminder includes a shell-quoted command that changes to the recorded cwd and launches `pi --session` with the recorded session ID. Local sessions run directly; remote sessions use `build_remote_launch_argv`, which defaults to `ssh -t --` against the recorded `username@hostname` and can be replaced for other remote launchers.
 
 ### Prerequisites (once, on the Mac)
 
 1. **Settings → General → Magic → Enable Python API**.
-2. **Scripts → Install Python Runtime** (renamed to **Check for Updated Runtime** once this has been done before). This is what actually provisions iTerm2's bundled Python interpreter under `~/Library/Application Support/iTerm2/iterm2env/versions/`; it's a separate step from enabling the API and from installing the daemon file itself, and nothing here runs without it.
+2. **Scripts → Install Python Runtime** (renamed to **Check for Updated Runtime** once this has been done before). This provisions iTerm2's bundled Python interpreter under `~/Library/Application Support/iTerm2/iterm2env/versions/`.
+3. Add the installed shell integration to the local Mac shell configuration:
+   ```zsh
+   test -e "${HOME}/.pi-iterm2/shell.sh" && source "${HOME}/.pi-iterm2/shell.sh"
+   ```
+   Put it in `~/.zshrc` for zsh or `~/.bashrc` for bash. `/iterm2-install` places it before Powerlevel10k's instant-prompt preamble and can configure either or both files. A login bash setup must already source `~/.bashrc` from `~/.bash_profile`. The hook runs only in local, non-tmux iTerm2 shells and checks once per shell.
 
 ### If pi-iterm2 is installed locally on the Mac
 
-Three commands, only registered when pi is running on macOS:
+One Pi command is registered when Pi runs on macOS:
 
-- `/iterm2-daemon-install` — copies the bundled daemon to `~/Library/Application Support/iTerm2/Scripts/AutoLaunch/pi_iterm2_daemon.py`. Safe to run again to pick up an update; it just overwrites.
-- `/iterm2-daemon-check` — asks the running daemon for a report about the tab you're in: current live variables, what's stored, and exactly what would be printed if this tab were restored right now. Read-only.
-- `/iterm2-daemon-check-all` — asks for the same report for every live session, plus a count of stored records whose tabs no longer exist.
+- `/iterm2-install` — separately prompts to install or update the AutoLaunch recorder and the shell integration. Shell installation copies `~/.pi-iterm2/shell.sh` and its Python helper, can apply the same host identity to ordinary shell tabs, can enable the default-no restore execution prompt, and can add the guarded `test -e ... && source ...` line to `~/.zshrc` and `~/.bashrc`. Existing guarded lines are detected and unguarded source lines are upgraded, so rerunning it is safe.
 
-The check commands use the running AutoLaunch daemon's already-authenticated iTerm2 connection through a user-only local socket at `~/.pi-iterm2/daemon.sock`. They do not start a second Python API client, because iTerm2's one-time authentication can reject programs launched as captured child processes (including Pi extension commands) even when the same command works in an ordinary shell.
+Sourcing the hook adds two ordinary shell commands, available without starting Pi:
 
-After `/iterm2-daemon-install` (and the prerequisites above), restart iTerm2 for it to start running. Reinstall and restart after upgrading from a daemon version that does not yet provide the local check socket.
+- `pi-iterm2-check` — report the current tab's stored record and reminder preview.
+- `pi-iterm2-check-all` — report every stored tab record.
+
+Both commands read `state.json` and `state.previous.json` directly; they do not require the recorder to be running.
+
+On macOS, `/iterm2-install` offers the recorder, shell integration, and optional ordinary-shell host identity. On remote Linux hosts it skips the macOS recorder and installs only the shell hook, which publishes `RemoteHost` and `CurrentDir` using shell builtins—no Python runtime is required. After installation, reload the configured shell file or open a new shell. Restart iTerm2 after updating the macOS recorder.
 
 ### Otherwise
 
@@ -245,17 +223,24 @@ mkdir -p ~/Library/Application\ Support/iTerm2/Scripts/AutoLaunch
 
 curl -fsSL https://raw.githubusercontent.com/dreveman/pi-iterm2/main/macos/pi_iterm2_daemon.py \
   -o ~/Library/Application\ Support/iTerm2/Scripts/AutoLaunch/pi_iterm2_daemon.py
-```
-`mkdir -p` first because that folder doesn't exist until iTerm2's Scripts/Python API has been used at least once. After the prerequisites above, restart iTerm2 — AutoLaunch scripts aren't hot-reloaded, so re-run the `curl` and restart iTerm2 again any time the daemon is updated. See the file's own header comment for how it works.
-
-To check it manually, run it directly with `--check`, using iTerm2's bundled Python. iTerm2 can leave more than one entry under `versions/` (e.g. a stale one alongside a freshly installed runtime), so pick whichever has been modified most recently rather than assuming there's only one:
-```bash
+mkdir -p ~/.pi-iterm2
+cp ~/Library/Application\ Support/iTerm2/Scripts/AutoLaunch/pi_iterm2_daemon.py \
+  ~/.pi-iterm2/pi_iterm2.py
+curl -fsSL https://raw.githubusercontent.com/dreveman/pi-iterm2/main/shell/pi_iterm2_restore.sh \
+  -o ~/.pi-iterm2/shell.sh
 python3=$(ls -t ~/Library/Application\ Support/iTerm2/iterm2env/versions/*/bin/python3 2>/dev/null | head -1)
-"$python3" ~/Library/Application\ Support/iTerm2/Scripts/AutoLaunch/pi_iterm2_daemon.py --check
+"$python3" ~/.pi-iterm2/pi_iterm2.py --refresh-record-index
 ```
-This is read-only — it never injects anything, just prints. Pass `--session <id>` to check a different tab than the one you're running it from.
+`mkdir -p` first because that folder doesn't exist until iTerm2's Scripts/Python API has been used at least once. Add `test -e "${HOME}/.pi-iterm2/shell.sh" && source "${HOME}/.pi-iterm2/shell.sh"` to `~/.zshrc` or `~/.bashrc`, then restart iTerm2. A login bash setup must source `~/.bashrc` from `~/.bash_profile`. AutoLaunch scripts aren't hot-reloaded, so re-run the downloads and restart iTerm2 again any time the daemon is updated. See the file's own header comment for how it works.
 
-`--check-all` covers every live session instead — all panes of all tabs of all windows, plus buried sessions. Tabs that have a stored record get the full report; the rest are summarized one line each (still showing whether pi is live in them), since a tab with no record has nothing to preview. The tab you ran it from is marked, and a closing line counts stored records belonging to tabs that no longer exist. It needs no `ITERM_SESSION_ID`, so it also works from outside iTerm2.
+After sourcing the hook, check the current tab or every stored session directly from the shell:
+
+```bash
+pi-iterm2-check
+pi-iterm2-check-all
+```
+
+Both are read-only. `pi-iterm2-check --session <id>` targets a different tab.
 
 ## Development
 
