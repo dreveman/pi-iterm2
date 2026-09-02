@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+# shellcheck disable=SC1003,SC2012,SC2128,SC2178,SC2319
 # pi-iterm2 restored-session pre-prompt hook.
 # Source this from ~/.zshrc or ~/.bashrc on the Mac running iTerm2.
 

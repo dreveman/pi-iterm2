@@ -194,7 +194,7 @@ async def run_async_tests():
         )
         try:
             daemon.build_check_report(None)
-            assert False, "missing session id must fail"
+            raise AssertionError("missing session id must fail")
         except ValueError:
             pass
         assert "Stored records" in daemon.build_check_all_report()
@@ -303,6 +303,16 @@ assert daemon.shlex.split(local_command) == [
 ]
 
 assert daemon.build_resume_command({"hostname": "host"}) is None
+assert (
+    daemon.build_resume_command({"hostname": "-oProxyCommand=evil", "cwd": "/cwd"})
+    is None
+)
+assert (
+    daemon.build_resume_command(
+        {"hostname": "host", "username": "-oProxyCommand=evil", "cwd": "/cwd"}
+    )
+    is None
+)
 shell_command = daemon.build_resume_command(
     {"hostname": "host", "cwd": "/cwd", "piSessionId": "friendly-name"},
     local_hostname="workstation.local",
@@ -407,7 +417,8 @@ poisoned = daemon.build_reminder_line(
 # The only escapes left are the fixed styling sequences built by the renderer.
 assert "\x1b]" not in poisoned
 assert "\x1b[2J" not in poisoned
-assert poisoned.count("\n") == 3
+assert poisoned.count("\n") == 2
+assert "Run " not in poisoned  # invalid remote identities never become commands
 assert "pwned" in poisoned  # the text survives; only the control bytes are removed
 
 # Missing Pi fields fall back to shell-location recovery.

@@ -86,6 +86,7 @@ RECORD_INDEX_PATH = STATE_PATH.parent / "record-ids"
 APP_RUN_MARKER = "user.pi_iterm2_app_run"
 HOST_COLOR_PATTERN = re.compile(r"#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})")
 ITERM_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+REMOTE_IDENTITY_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
 PI_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
 CONFIG_PATH = Path.home() / ".pi" / "agent" / "pi-iterm2.json"
 VSCODE_SETTINGS_PATHS = [
@@ -190,7 +191,7 @@ def sync_record_index() -> None:
     try:
         if RECORD_INDEX_PATH.read_text() == contents:
             return
-    except (FileNotFoundError, OSError, UnicodeDecodeError):
+    except (OSError, UnicodeDecodeError):
         pass
     tmp = RECORD_INDEX_PATH.with_name(
         f"{RECORD_INDEX_PATH.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
@@ -531,6 +532,10 @@ def build_resume_command(
     pi_session_id = sanitize_text(prior.get("piSessionId"))
     if not host or not cwd:
         return None
+    if not REMOTE_IDENTITY_PATTERN.fullmatch(host):
+        return None
+    if user and not REMOTE_IDENTITY_PATTERN.fullmatch(user):
+        return None
     resume_command = f"cd -- {shlex.quote(cwd)}"
     has_pi_session = is_pi_session_id(
         pi_session_id, exact=prior.get("piSessionIdExact") is True
@@ -579,8 +584,7 @@ def build_reminder_line(
         restore_target = "session"
     else:
         reminder = (
-            f"\x1b[2mLast shell location in this tab was "
-            f"{where}, {ago} ago.\x1b[0m\n"
+            f"\x1b[2mLast shell location in this tab was {where}, {ago} ago.\x1b[0m\n"
         )
         restore_target = "shell"
     command = build_resume_command(prior, local_hostname)
@@ -649,12 +653,16 @@ def read_single_key(prompt: str) -> str:
         sys.stdout.flush()
 
 
+def stdio_is_tty() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def maybe_run_restore(
     prior: Optional[dict], input_fn=None, run_fn=subprocess.run, tty_check=None
 ) -> bool:
     """Optionally run the displayed command after an explicit default-no prompt."""
     if tty_check is None:
-        tty_check = lambda: sys.stdin.isatty() and sys.stdout.isatty()
+        tty_check = stdio_is_tty
     if not tty_check():
         return False
     config = read_json(CONFIG_PATH)
@@ -695,7 +703,7 @@ def emit_pending_replay() -> int:
         sys.stdout.flush()
         maybe_run_restore(prior)
         return 0
-    except (OSError, TypeError, ValueError, UnicodeError):
+    except (OSError, TypeError, ValueError):
         return 1
 
 
