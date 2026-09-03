@@ -89,17 +89,6 @@ ITERM_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 REMOTE_IDENTITY_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
 PI_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
 CONFIG_PATH = Path.home() / ".pi" / "agent" / "pi-iterm2.json"
-VSCODE_SETTINGS_PATHS = [
-    Path.home() / ".vscode-remote" / "data" / "Machine" / "settings.json",
-    Path.home() / ".vscode-server" / "data" / "Machine" / "settings.json",
-]
-VSCODE_COLOR_KEYS = [
-    "titleBar.activeBackground",
-    "titleBar.inactiveBackground",
-    "activityBar.background",
-]
-IDLE_SATURATION = 45
-IDLE_LIGHTNESS = 30
 # Everything this daemon reports comes from iTerm2 session variables, and any process that
 # can write to a terminal can set those with OSC 1337;SetUserVar -- the payload is base64,
 # so arbitrary bytes, ESC included, survive into the variable intact. Those values get
@@ -341,169 +330,12 @@ def is_local_hostname(
     return normalized in {alias.rstrip(".").lower() for alias in aliases if alias}
 
 
-def fnv1a(text: str) -> int:
-    hashed = 0x811C9DC5
-    for character in text:
-        hashed = ((hashed ^ ord(character)) * 0x01000193) & 0xFFFFFFFF
-    return hashed
-
-
-def rgb_to_hue(red: int, green: int, blue: int) -> float:
-    red, green, blue = red / 255, green / 255, blue / 255
-    largest = max(red, green, blue)
-    delta = largest - min(red, green, blue)
-    if delta == 0:
-        return 0
-    if largest == red:
-        sextant = ((green - blue) / delta) % 6
-    elif largest == green:
-        sextant = (blue - red) / delta + 2
-    else:
-        sextant = (red - green) / delta + 4
-    return (sextant * 60) % 360
-
-
-def hue_from_css_hex(value: str) -> Optional[float]:
-    match = re.fullmatch(r"#([0-9a-fA-F]{3,8})", value.strip())
-    if match is None:
-        return None
-    digits = match.group(1)
-    if len(digits) in (3, 4):
-        digits = "".join(digit * 2 for digit in digits[:3])
-    elif len(digits) in (6, 8):
-        digits = digits[:6]
-    else:
-        return None
-    return rgb_to_hue(int(digits[0:2], 16), int(digits[2:4], 16), int(digits[4:6], 16))
-
-
-def parse_color_spec(value) -> Optional[float]:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return value % 360
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    match = re.fullmatch(r"#?([0-9a-fA-F]{6})", text)
-    if match is not None:
-        digits = match.group(1)
-        return rgb_to_hue(
-            int(digits[0:2], 16), int(digits[2:4], 16), int(digits[4:6], 16)
-        )
-    if re.fullmatch(r"[+-]?\d+(\.\d+)?", text):
-        return float(text) % 360
-    return None
-
-
-def hsl_to_rgb(hue: float, saturation: float, lightness: float) -> tuple[int, int, int]:
-    saturation, lightness = saturation / 100, lightness / 100
-    chroma = (1 - abs(2 * lightness - 1)) * saturation
-    sextant = (hue % 360) / 60
-    second = chroma * (1 - abs((sextant % 2) - 1))
-    base = lightness - chroma / 2
-    order = [
-        (chroma, second, 0),
-        (second, chroma, 0),
-        (0, chroma, second),
-        (0, second, chroma),
-        (second, 0, chroma),
-        (chroma, 0, second),
-    ]
-    return tuple(
-        math.floor((channel + base) * 255 + 0.5)
-        for channel in order[min(int(sextant), 5)]
-    )
-
-
 def read_json(path: Path):
     try:
         value = json.loads(path.read_text())
         return value
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
-
-
-def vscode_hue() -> Optional[tuple[float, str]]:
-    for path in VSCODE_SETTINGS_PATHS:
-        settings = read_json(path)
-        if not isinstance(settings, dict):
-            continue
-        colors = settings.get("workbench.colorCustomizations")
-        if not isinstance(colors, dict):
-            continue
-        for key in VSCODE_COLOR_KEYS:
-            value = colors.get(key)
-            if isinstance(value, str):
-                hue = hue_from_css_hex(value)
-                if hue is not None:
-                    return hue, f"{key} in {path}"
-    return None
-
-
-def resolve_shell_hue(host: str, config: dict) -> tuple[float, str]:
-    host_colors = config.get("hostColors")
-    pinned = (
-        parse_color_spec(host_colors.get(host))
-        if isinstance(host_colors, dict)
-        else None
-    )
-    if pinned is not None:
-        return pinned, "hostColors pin"
-    if config.get("vscodeColor", True):
-        found = vscode_hue()
-        if found is not None:
-            return found[0], f"VS Code window color ({found[1]})"
-    palette_value = config.get("palette")
-    palette = [
-        hue
-        for hue in (
-            parse_color_spec(entry)
-            for entry in (palette_value if isinstance(palette_value, list) else [])
-        )
-        if hue is not None
-    ]
-    if palette:
-        return palette[fnv1a(f"host:{host}") % len(palette)], "palette"
-    return float(fnv1a(f"host:{host}") % 360), "hostname hash"
-
-
-def shell_identity_output(check: bool = False) -> int:
-    host = os.uname().nodename
-    config_value = read_json(CONFIG_PATH)
-    config = config_value if isinstance(config_value, dict) else {}
-    disabled = None
-    if config.get("enabled") is False:
-        disabled = f"enabled is false in {CONFIG_PATH}"
-    elif config.get("tabColor") is False:
-        disabled = f"tabColor is false in {CONFIG_PATH}"
-    if disabled:
-        if check:
-            print(f"host:     {host}")
-            print(f"disabled: {disabled}")
-        return 0
-
-    hue, source = resolve_shell_hue(host, config)
-    rgb = hsl_to_rgb(hue, IDLE_SATURATION, IDLE_LIGHTNESS)
-    sequence = "".join(
-        f"\x1b]6;1;bg;{name};brightness;{value}\x07"
-        for name, value in (("red", rgb[0]), ("green", rgb[1]), ("blue", rgb[2]))
-    )
-    if os.environ.get("TMUX"):
-        sequence = "\x1bPtmux;" + sequence.replace("\x1b", "\x1b\x1b") + "\x1b\\"
-    if check:
-        colored_host = f"\x1b[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m{host}\x1b[39m"
-        print(f"host:   {colored_host}")
-        print(f"hue:    {hue:.1f} deg")
-        print(f"source: {source}")
-        print(
-            f"color:  rgb({rgb[0]},{rgb[1]},{rgb[2]})  "
-            f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
-        )
-        return 0
-    sys.stdout.write(sequence)
-    sys.stdout.flush()
-    return 0
 
 
 def build_remote_launch_argv(
@@ -895,10 +727,6 @@ def main() -> None:
         action="store_true",
         help=argparse.SUPPRESS,
     )
-    mode.add_argument("--shell-identity", action="store_true", help=argparse.SUPPRESS)
-    mode.add_argument(
-        "--shell-identity-check", action="store_true", help=argparse.SUPPRESS
-    )
     args = parser.parse_args()
     if args.session and not args.check:
         parser.error("--session requires --check")
@@ -908,8 +736,6 @@ def main() -> None:
     if args.refresh_record_index:
         sync_record_index()
         return
-    if args.shell_identity or args.shell_identity_check:
-        raise SystemExit(shell_identity_output(check=args.shell_identity_check))
     if args.check_all:
         print(build_check_all_report())
         return

@@ -69,6 +69,8 @@ Defaults apply with no configuration file. Override in:
 
 `TERM_PROGRAM` is a local environment variable your shell doesn't forward over SSH, so `"auto"` never activates the extension on a remote host — even though your client is genuinely iTerm2. Set `"enabled": true` in that host's `~/.pi/agent/pi-iterm2.json` to force it on there.
 
+This applies to Pi's own activation only. The [shell integration](#shell-tabs-without-pi) never consults `TERM_PROGRAM`, precisely because it can't be consulted usefully over SSH; installing it is the consent, and `"enabled": false` or `"tabColor": false` turns its color off.
+
 Missing configuration uses the defaults. Invalid JSON, unknown fields, and invalid option types produce a warning (shown once at session start) and fall back to the defaults.
 
 ## How tab color is chosen
@@ -159,7 +161,19 @@ Note that a fully grey window color (some "black"/"charcoal" presets) has no hue
 
 ## Shell tabs without Pi
 
-The installed shell integration treats ordinary shell tabs as the same recoverable tabs with optional Pi metadata. On the Mac it applies the host's resting identity color. On remote hosts it publishes `RemoteHost` and `CurrentDir` at each prompt using shell builtins, allowing the Mac recorder to store the remote host and cwd without Pi or Python. It uses the same `~/.pi/agent/pi-iterm2.json` precedence as Pi (`hostColors` → VS Code window color → `palette` → hostname hash).
+The installed shell integration treats ordinary shell tabs as the same recoverable tabs with optional Pi metadata. It applies the host's resting identity color and publishes `RemoteHost` and `CurrentDir` at each prompt, allowing the Mac recorder to store the remote host and cwd without Pi or Python. It uses the same `~/.pi/agent/pi-iterm2.json` precedence as Pi (`hostColors` → VS Code window color → `palette` → hostname hash).
+
+Both halves are shell builtins only — the hue hash, the VS Code settings lookup, and the HSL conversion are all computed in the rc file, with hues carried as integer millidegrees because bash has no floating-point arithmetic. So a remote host colors its own tabs with no Python runtime, no iTerm2 Python API, and no daemon, and it does so under the same single condition that publishes host and cwd: the marker file `/iterm2-install` writes. `TERM_PROGRAM` is deliberately not part of that condition, since SSH does not forward it and testing it would rule out every remote shell; a terminal that isn't iTerm2 discards these sequences the same way it already discards the location ones.
+
+`pi-iterm2-identity` reports what that resolution produced — the host, its hue, which rule chose it, and the resulting color — and is the way to check the color on a host with no Pi and no Python:
+
+```bash
+pi-iterm2-identity
+```
+
+Because the shell works in exact integer arithmetic where Pi and the recorder use floats, a channel value can land one unit away from theirs when the exact result sits precisely on a rounding boundary. That is at most 1/255 of one channel, and never a visible difference.
+
+One caveat is worth knowing: the hue is derived from the hostname, and the hook reads the shell's own `HOSTNAME`/`HOST` — the same value it publishes as `RemoteHost`. Both bash and zsh set that from `gethostname()`, which is what Pi and the recorder use, so the derivation agrees. If some host reports two different names anyway, pin it with `hostColors` (or `/iterm2-color`) and the pin settles it.
 
 After a restart, a tab with Pi metadata gets the exact `pi --session` resume command. A remote tab without a Pi session ID gets a command that reconnects, changes to the recorded directory, and opens an interactive login shell. A local shell tab needs no restore command because iTerm2 restores its cwd. Agent status brightness is naturally available only while Pi is running.
 
@@ -206,14 +220,15 @@ One Pi command is registered when Pi runs on macOS:
 
 - `/iterm2-install` — separately prompts to install or update the AutoLaunch recorder and the shell integration. Shell installation copies `~/.pi-iterm2/shell.sh` and its Python helper, can apply the same host identity to ordinary shell tabs, can enable the default-no restore execution prompt, and can add the guarded `test -e ... && source ...` line to `~/.zshrc` and `~/.bashrc`. Existing guarded lines are detected and unguarded source lines are upgraded, so rerunning it is safe.
 
-Sourcing the hook adds two ordinary shell commands, available without starting Pi:
+Sourcing the hook adds three ordinary shell commands, available without starting Pi:
 
 - `pi-iterm2-check` — report the current tab's stored record and reminder preview.
 - `pi-iterm2-check-all` — report every stored tab record.
+- `pi-iterm2-identity` — report this host's resting color and where its hue came from.
 
-Both commands read `state.json` and `state.previous.json` directly; they do not require the recorder to be running.
+The first two read `state.json` and `state.previous.json` directly; they do not require the recorder to be running. `pi-iterm2-identity` needs neither the recorder nor Python and works on a remote host too.
 
-On macOS, `/iterm2-install` offers the recorder, shell integration, and optional ordinary-shell host identity. On remote Linux hosts it skips the macOS recorder and installs only the shell hook, which publishes `RemoteHost` and `CurrentDir` using shell builtins—no Python runtime is required. After installation, reload the configured shell file or open a new shell. Restart iTerm2 after updating the macOS recorder.
+On macOS, `/iterm2-install` offers the recorder, shell integration, and optional ordinary-shell host identity. On remote Linux hosts it skips the macOS recorder and installs only the shell hook, which resolves the host color and publishes `RemoteHost` and `CurrentDir` using shell builtins—no Python runtime is required. After installation, reload the configured shell file or open a new shell. Restart iTerm2 after updating the macOS recorder.
 
 ### Otherwise
 
@@ -231,16 +246,26 @@ curl -fsSL https://raw.githubusercontent.com/dreveman/pi-iterm2/main/shell/pi_it
 python3=$(ls -t ~/Library/Application\ Support/iTerm2/iterm2env/versions/*/bin/python3 2>/dev/null | head -1)
 "$python3" ~/.pi-iterm2/pi_iterm2.py --refresh-record-index
 ```
-`mkdir -p` first because that folder doesn't exist until iTerm2's Scripts/Python API has been used at least once. Add `test -e "${HOME}/.pi-iterm2/shell.sh" && source "${HOME}/.pi-iterm2/shell.sh"` to `~/.zshrc` or `~/.bashrc`, then restart iTerm2. A login bash setup must source `~/.bashrc` from `~/.bash_profile`. AutoLaunch scripts aren't hot-reloaded, so re-run the downloads and restart iTerm2 again any time the daemon is updated. See the file's own header comment for how it works.
+On a remote host only the rc file matters, since the color and the location sequences are pure shell:
+```bash
+mkdir -p ~/.pi-iterm2
+curl -fsSL https://raw.githubusercontent.com/dreveman/pi-iterm2/main/shell/pi_iterm2_restore.sh \
+  -o ~/.pi-iterm2/shell.sh
+touch ~/.pi-iterm2/remote-location-enabled ~/.pi-iterm2/shell-identity-enabled
+```
+Drop the `shell-identity-enabled` marker to publish host and cwd without coloring ordinary tabs.
+
+Back on the Mac, `mkdir -p` comes first because that folder doesn't exist until iTerm2's Scripts/Python API has been used at least once. Add `test -e "${HOME}/.pi-iterm2/shell.sh" && source "${HOME}/.pi-iterm2/shell.sh"` to `~/.zshrc` or `~/.bashrc`, then restart iTerm2. A login bash setup must source `~/.bashrc` from `~/.bash_profile`. AutoLaunch scripts aren't hot-reloaded, so re-run the downloads and restart iTerm2 again any time the daemon is updated. See the file's own header comment for how it works.
 
 After sourcing the hook, check the current tab or every stored session directly from the shell:
 
 ```bash
 pi-iterm2-check
 pi-iterm2-check-all
+pi-iterm2-identity
 ```
 
-Both are read-only. `pi-iterm2-check --session <id>` targets a different tab.
+All three are read-only. `pi-iterm2-check --session <id>` targets a different tab.
 
 ## Development
 

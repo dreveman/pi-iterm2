@@ -94,6 +94,18 @@ test("hslToRgb matches known primary colors", () => {
 	assert.deepEqual(hslToRgb(30, 45, 30), { r: 111, g: 77, b: 42 });
 });
 
+// shell/pi_iterm2_restore.sh repeats this derivation with shell builtins so an ordinary tab
+// gets its host color without Python, on a Mac and on a remote host alike. These are the
+// vectors test/daemon_test.py pins for that hook; the two implementations have to agree.
+test("the resting host color agrees with the shell hook's golden vectors", () => {
+	const palette = ["#8abeb7", "#81a2be", "#9575cd", "#b5bd68"].map((color) => parseColorSpec(color)!);
+	assert.equal(hashString("host:golden-host"), 3016085159);
+	assert.deepEqual(tabColorForHue(hostHue("golden-host")), { r: 43, g: 111, b: 42 });
+	assert.deepEqual(tabColorForHue(hostHue("golden-host", palette)), { r: 104, g: 111, b: 42 });
+	assert.deepEqual(tabColorForHue(parseColorSpec("#ff0000")!), { r: 111, g: 42, b: 42 });
+	assert.deepEqual(tabColorForHue(hueFromCssHex("#3a7d44")!), { r: 42, g: 111, b: 52 });
+});
+
 test("computeTabColorRgb varies by host, session, and status but is stable for the same inputs", () => {
 	const cfg = DEFAULT_CONFIG;
 	const base = computeTabColorRgb(cfg, "host-a", "session-1", "idle");

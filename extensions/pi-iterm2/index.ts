@@ -61,7 +61,10 @@ function refreshRecordIndex(): void {
 	} catch {
 		// The recorder creates the recovery index on the next iTerm2 launch.
 	}
-	const temporaryPath = `${RECORD_INDEX_PATH}.tmp`;
+	// A pid+uuid suffix matches the daemon's sync_record_index so two overlapping writers (e.g.
+	// /iterm2-install in two sessions, or one racing the daemon's --refresh-record-index) can't
+	// interleave into a shared temp file and rename a partial index into place.
+	const temporaryPath = `${RECORD_INDEX_PATH}.${process.pid}.${randomUUID()}.tmp`;
 	writeFileSync(temporaryPath, [...ids].sort().map((id) => `${id}\n`).join(""), { encoding: "utf8", mode: 0o600 });
 	chmodSync(temporaryPath, 0o600);
 	renameSync(temporaryPath, RECORD_INDEX_PATH);
@@ -206,7 +209,9 @@ export default function (pi: ExtensionAPI) {
 			let shellInstalled = false;
 			let shellConfigured = false;
 			let shellIdentityEnabled = false;
-			let shellAvailable = existsSync(SHELL_HOOK_INSTALL_PATH) && existsSync(SHELL_HELPER_INSTALL_PATH);
+			// The Python helper is a Mac-only concern: off the Mac the hook resolves the host
+			// color and publishes host and cwd with shell builtins alone.
+			let shellAvailable = existsSync(SHELL_HOOK_INSTALL_PATH) && (!isDarwin || existsSync(SHELL_HELPER_INSTALL_PATH));
 			if (isDarwin && (await confirm("Install pi-iterm2 recorder?", `This will copy the AutoLaunch recorder to ${DAEMON_INSTALL_PATH}.`))) {
 				if (!existsSync(DAEMON_SOURCE_PATH)) {
 					ctx.ui.notify(`Daemon source not found at ${DAEMON_SOURCE_PATH}. Reinstall the pi-iterm2 package.`, "error");
@@ -227,7 +232,7 @@ export default function (pi: ExtensionAPI) {
 				"Install pi-iterm2 shell integration?",
 				isDarwin
 					? `This will copy the shell integration, helper, and shell check commands to ${STATE_DIR}.`
-					: `This will copy the host/cwd publishing hook to ${SHELL_HOOK_INSTALL_PATH}.`,
+					: `This will copy the host color and host/cwd publishing hook to ${SHELL_HOOK_INSTALL_PATH}.`,
 			);
 			if (installShell) {
 				if (!existsSync(SHELL_HOOK_SOURCE_PATH) || (isDarwin && !existsSync(DAEMON_SOURCE_PATH))) {
@@ -270,9 +275,9 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			if (isDarwin && shellAvailable && (await confirm(
+			if (shellAvailable && (await confirm(
 				"Apply host identity to ordinary shells?",
-				"This will use the same resting host color for shell tabs that do not run Pi.",
+				"This will use the same resting host color for shell tabs that do not run Pi, on this host and on any remote host where the hook is installed.",
 			))) {
 				try {
 					writeFileSync(SHELL_IDENTITY_ENABLED_PATH, "enabled\n", { encoding: "utf8", mode: 0o600 });

@@ -429,8 +429,6 @@ assert "0s ago" in daemon.build_reminder_line(
     {"piSessionId": "id", "cwd": "/c", "updatedAt": float("nan")}
 )
 assert daemon.build_reminder_line(["not", "a", "record"]) is None
-# Golden vector for JS Math.round compatibility (Python round would make green 76).
-assert daemon.hsl_to_rgb(30, 45, 30) == (111, 77, 42)
 reminder = daemon.build_reminder_line(
     {
         "hostname": "host",
@@ -444,21 +442,155 @@ reminder = daemon.build_reminder_line(
 assert "\x1b[22;38;2;1;2;3mhost\x1b[2;39m /cwd" in reminder
 asyncio.run(run_async_tests())
 
-with tempfile.TemporaryDirectory(prefix="pi-iterm2-shell-test-") as home:
+restore_hook = Path(__file__).parents[1] / "shell" / "pi_iterm2_restore.sh"
+
+
+def run_hook(snippet: str, home: str, **variables: str) -> str:
+    """Run one snippet against the hook in both shells, asserting they agree.
+
+    The color resolver is pure shell so that a remote host needs no Python, which makes bash
+    and zsh parity part of its contract rather than an implementation detail.
+    """
     environment = os.environ.copy()
     environment["HOME"] = home
-    shell_check = subprocess.check_output(
-        [
-            sys.executable,
-            str(Path(__file__).parents[1] / "macos" / "pi_iterm2_daemon.py"),
-            "--shell-identity-check",
-        ],
-        env=environment,
-        text=True,
-    )
-    assert re.search(r"host:\s+\x1b\[38;2;\d+;\d+;\d+m.+\x1b\[39m", shell_check)
+    for name in ("TERM_PROGRAM", "ITERM_SESSION_ID", "TMUX"):
+        environment.pop(name, None)
+    environment.update(variables)
+    outputs = {
+        shell: subprocess.check_output(
+            [shell, "-c", f'source "$1"; {snippet}', shell, str(restore_hook)],
+            env=environment,
+            text=True,
+        )
+        for shell in ("bash", "zsh")
+    }
+    assert outputs["bash"] == outputs["zsh"], outputs
+    return outputs["bash"]
 
-restore_hook = Path(__file__).parents[1] / "shell" / "pi_iterm2_restore.sh"
+
+IDENTITY = (
+    "_pi_iterm2_shell_identity_color; "
+    'printf "%s %s %s|%s" "$_pi_iterm2_red" "$_pi_iterm2_green" "$_pi_iterm2_blue" "$_pi_iterm2_identity_source"'
+)
+
+with tempfile.TemporaryDirectory(prefix="pi-iterm2-shell-test-") as home:
+    config_path = Path(home) / ".pi" / "agent" / "pi-iterm2.json"
+    config_path.parent.mkdir(parents=True)
+    vscode_path = Path(home) / ".vscode-server" / "data" / "Machine" / "settings.json"
+    vscode_path.parent.mkdir(parents=True)
+
+    # Golden vector for JS Math.round compatibility: Python's round() would make green 76.
+    assert (
+        run_hook(
+            '_pi_iterm2_hsl_rgb 30000 45 30; printf "%s %s %s" "$_pi_iterm2_red" "$_pi_iterm2_green" "$_pi_iterm2_blue"',
+            home,
+        )
+        == "111 77 42"
+    )
+    # FNV-1a over "host:golden-host", the same hash core.ts derives a hue bucket from.
+    assert (
+        run_hook('_pi_iterm2_hash "host:golden-host"; printf "%s" "$REPLY"', home)
+        == "3016085159"
+    )
+    # Hue is carried in millidegrees, so a hex color keeps its full precision.
+    assert (
+        run_hook(
+            '_pi_iterm2_color_spec_hue "\\"#81a2be\\""; printf "%s" "$REPLY"', home
+        )
+        == "207541"
+    )
+    # A six-digit string is a color, not a hue, and shorthand CSS hex is doubled.
+    assert (
+        run_hook('_pi_iterm2_color_spec_hue "\\"123456\\""; printf "%s" "$REPLY"', home)
+        == "210000"
+    )
+    assert (
+        run_hook('_pi_iterm2_css_hex_hue "#abc"; printf "%s" "$REPLY"', home)
+        == "210000"
+    )
+    # A CSS hex color needs its #, so a bare number stays a hue.
+    assert run_hook('_pi_iterm2_css_hex_hue "abc" || printf failed', home) == "failed"
+
+    def identity():
+        return run_hook(IDENTITY, home, HOSTNAME="golden-host", HOST="golden-host")
+
+    # No config file at all: the hostname hash spreads over the whole hue range.
+    assert identity() == "43 111 42|hostname hash"
+    config_path.write_text('{"palette": ["#8abeb7", "#81a2be", "#9575cd", "#b5bd68"]}')
+    assert identity() == "104 111 42|palette"
+    # A palette of nothing usable is the same as no palette.
+    config_path.write_text('{"palette": ["nonsense", true]}')
+    assert identity() == "43 111 42|hostname hash"
+    config_path.write_text(
+        '{"palette": ["#8abeb7"], "hostColors": {"golden-host": "#ff0000"}}'
+    )
+    assert identity() == "111 42 42|hostColors pin"
+    # A pin for a different host does not apply to this one.
+    config_path.write_text('{"hostColors": {"other-host": 42}}')
+    assert identity() == "43 111 42|hostname hash"
+    # Unparseable config is no config, because a tab is no place to report broken JSON.
+    config_path.write_text("not json at all")
+    assert identity() == "43 111 42|hostname hash"
+    # Only an explicit false turns the color off; "auto" governs Pi's own activation.
+    config_path.write_text('{"enabled": false}')
+    assert identity() == "  |enabled is false in " + str(config_path)
+    config_path.write_text('{"enabled": "auto", "tabColor": false}')
+    assert identity() == "  |tabColor is false in " + str(config_path)
+    config_path.write_text('{"enabled": "auto"}')
+    assert identity() == "43 111 42|hostname hash"
+
+    # The VS Code window color outranks a palette, and comments and trailing commas parse:
+    # VS Code writes settings.json with both, and json.loads would reject them.
+    config_path.write_text('{"palette": ["#8abeb7"]}')
+    vscode_path.write_text(
+        "{\n"
+        "  // window color\n"
+        '  "workbench.colorCustomizations": {\n'
+        "    /* pinned by hand */\n"
+        '    "titleBar.activeBackground": "#3a7d44",\n'
+        "  },\n"
+        "}\n"
+    )
+    assert (
+        identity()
+        == f"42 111 52|VS Code window color (titleBar.activeBackground in {vscode_path})"
+    )
+    # A pin still wins over VS Code, and "vscodeColor": false ignores the file entirely.
+    config_path.write_text(
+        '{"palette": ["#8abeb7"], "hostColors": {"golden-host": 250}}'
+    )
+    assert identity() == "54 42 111|hostColors pin"
+    config_path.write_text('{"palette": ["#8abeb7"], "vscodeColor": false}')
+    assert identity() == "42 111 102|palette"
+    # An empty colorCustomizations is how the color gets turned off in VS Code.
+    config_path.write_text("{}")
+    vscode_path.write_text('{"workbench.colorCustomizations": {}}')
+    assert identity() == "43 111 42|hostname hash"
+    # A key that is not a usable color falls through to the next key, then to the hash.
+    vscode_path.write_text(
+        '{"workbench.colorCustomizations": {"titleBar.activeBackground": 7,'
+        ' "activityBar.background": "#0f0"}}'
+    )
+    assert (
+        identity()
+        == "42 111 42|VS Code window color (activityBar.background in "
+        + str(vscode_path)
+        + ")"
+    )
+    vscode_path.unlink()
+
+    # The report is the only place the resolved color is shown to a person.
+    report = run_hook(
+        "pi-iterm2-identity", home, HOSTNAME="golden-host", HOST="golden-host"
+    )
+    assert re.search(r"host:\s+\x1b\[38;2;43;111;42mgolden-host\x1b\[39m", report)
+    assert "hue:    119.000 deg" in report
+    assert "color:  rgb(43,111,42)  #2b6f2a" in report
+    config_path.write_text('{"tabColor": false}')
+    assert "disabled: tabColor is false" in run_hook(
+        "pi-iterm2-identity", home, HOSTNAME="golden-host", HOST="golden-host"
+    )
+
 subprocess.check_call(["bash", "-n", str(restore_hook)])
 subprocess.check_call(["zsh", "-n", str(restore_hook)])
 subprocess.check_call(
@@ -549,5 +681,34 @@ with tempfile.TemporaryDirectory(prefix="pi-iterm2-remote-hook-test-") as home:
     )
     assert b"]1337;RemoteHost=alice@remote-host" in location_output
     assert b"]1337;CurrentDir=" in location_output
+
+    # Host identity is gated on its marker alone, the same way location publishing is gated
+    # on its own: TERM_PROGRAM is not forwarded over SSH, so testing it would rule out every
+    # remote shell. Sourcing the hook must paint the tab and leave the escape cached for the
+    # prompt hook to replay.
+    (state_dir / "shell-identity-enabled").write_text("enabled\n")
+    for shell, register in (
+        ("bash", "$PROMPT_COMMAND"),
+        ("zsh", "${precmd_functions[*]}"),
+    ):
+        identity_output = subprocess.check_output(
+            [
+                shell,
+                "-c",
+                f'source "$1"; printf "|%s|%s" "$PI_ITERM2_SHELL_IDENTITY" "{register}"',
+                shell,
+                str(restore_hook),
+            ],
+            env=remote_environment,
+            text=True,
+        )
+        painted, cached, registered = identity_output.split("|")
+        assert re.fullmatch(
+            r"(?:\x1b\]6;1;bg;(?:red|green|blue);brightness;\d+\x07){3}", cached
+        )
+        assert (
+            cached in painted
+        )  # printed once while sourcing, alongside the location sequences
+        assert "pi_iterm2_shell_identity" in registered
 
 print("ok - daemon and shell checks color hostnames and strip control bytes")
