@@ -39,7 +39,7 @@ import {
 	vsCodeHueFromSettings,
 	VSCODE_COLOR_KEYS,
 } from "../extensions/pi-iterm2/core.ts";
-import { configureShellRc } from "../extensions/pi-iterm2/index.ts";
+import { configureShellRc, installHintAction } from "../extensions/pi-iterm2/index.ts";
 /** A VS Code machine settings file as the tools that colorize a window actually write it. */
 function vscodeSettings(colors: Record<string, string> | undefined, extra: Record<string, unknown> = {}): string {
 	return JSON.stringify({ ...extra, ...(colors === undefined ? {} : { "workbench.colorCustomizations": colors }) }, null, 2);
@@ -580,6 +580,22 @@ test("configureShellRc appends or migrates guarded source lines idempotently", (
 	} finally {
 		rmSync(directory, { recursive: true, force: true });
 	}
+});
+
+test("installHintAction distinguishes first install, version upgrade, and up-to-date", () => {
+	// Never set up here: prompt to install.
+	assert.equal(installHintAction("0.1.3", undefined, false), "install");
+	// A pre-marker setup (shell hook present, no version recorded) reads as an upgrade.
+	assert.equal(installHintAction("0.1.3", undefined, true), "update");
+	// Set up for an older version: prompt to update.
+	assert.equal(installHintAction("0.1.3", "0.1.2", true), "update");
+	assert.equal(installHintAction("0.1.3", "0.1.2", false), "update");
+	// Already current: no hint, regardless of the hook probe.
+	assert.equal(installHintAction("0.1.3", "0.1.3", false), undefined);
+	assert.equal(installHintAction("0.1.3", "0.1.3", true), undefined);
+	// Unknown current version (unreadable package.json): stay silent rather than guess.
+	assert.equal(installHintAction(undefined, undefined, false), undefined);
+	assert.equal(installHintAction(undefined, "0.1.2", true), undefined);
 });
 
 console.log(`${passed} synchronous tests passed`);

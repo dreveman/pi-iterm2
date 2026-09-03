@@ -220,6 +220,8 @@ One Pi command is registered when Pi runs on macOS:
 
 - `/iterm2-install` — separately prompts to install or update the AutoLaunch recorder and the shell integration. Shell installation copies `~/.pi-iterm2/shell.sh` and its Python helper, can apply the same host identity to ordinary shell tabs, can enable the default-no restore execution prompt, and can add the guarded `test -e ... && source ...` line to `~/.zshrc` and `~/.bashrc`. Existing guarded lines are detected and unguarded source lines are upgraded, so rerunning it is safe.
 
+Until `/iterm2-install` has been run, a one-line hint at session start points to it, since the terminal integration is otherwise easy to miss. The hint records the package version it was run for in `~/.pi-iterm2/installed-version` and then stays quiet; after the package is upgraded it reappears once, worded as an update rather than a first install. It shows only in the interactive TUI, and (like the command itself) on any host, so a remote shell reached over SSH still surfaces it even where Pi's own tab coloring is inactive.
+
 Sourcing the hook adds three ordinary shell commands, available without starting Pi:
 
 - `pi-iterm2-check` — report the current tab's stored record and reminder preview.

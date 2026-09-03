@@ -29,6 +29,7 @@ const CONFIG_PATH = join(getAgentDir(), "pi-iterm2.json");
 
 // extensions/pi-iterm2/index.ts -> the package root is three levels up.
 const PACKAGE_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+const PACKAGE_JSON_PATH = join(PACKAGE_ROOT, "package.json");
 const DAEMON_SOURCE_PATH = join(PACKAGE_ROOT, "macos", "pi_iterm2_daemon.py");
 const SHELL_HOOK_SOURCE_PATH = join(PACKAGE_ROOT, "shell", "pi_iterm2_restore.sh");
 const AUTOLAUNCH_DIR = join(homedir(), "Library", "Application Support", "iTerm2", "Scripts", "AutoLaunch");
@@ -38,6 +39,9 @@ const SHELL_HOOK_INSTALL_PATH = join(STATE_DIR, "shell.sh");
 const SHELL_HELPER_INSTALL_PATH = join(STATE_DIR, "pi_iterm2.py");
 const SHELL_IDENTITY_ENABLED_PATH = join(STATE_DIR, "shell-identity-enabled");
 const REMOTE_LOCATION_ENABLED_PATH = join(STATE_DIR, "remote-location-enabled");
+// Records the package version /iterm2-install was last run for, so the startup hint can stop
+// once integration is set up and reappear (as an update prompt) after the package is bumped.
+const INSTALL_VERSION_PATH = join(STATE_DIR, "installed-version");
 const RECORD_INDEX_PATH = join(STATE_DIR, "record-ids");
 const PREVIOUS_STATE_PATH = join(STATE_DIR, "state.previous.json");
 const SHELL_SOURCE_LINE = 'test -e "${HOME}/.pi-iterm2/shell.sh" && source "${HOME}/.pi-iterm2/shell.sh"';
@@ -190,6 +194,54 @@ function currentUser(): string {
 	}
 }
 
+/** This package's own version, or undefined when package.json can't be read or parsed. */
+function packageVersion(): string | undefined {
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(PACKAGE_JSON_PATH, "utf8"));
+		if (isPlainObject(parsed) && typeof parsed.version === "string") return parsed.version;
+	} catch {
+		// No version to compare against; the caller simply skips the hint.
+	}
+	return undefined;
+}
+
+/** The version /iterm2-install last ran for, or undefined when it has never run here. */
+function lastInstalledVersion(): string | undefined {
+	try {
+		return readFileSync(INSTALL_VERSION_PATH, "utf8").trim() || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Which startup hint to show, if any: `"install"` when integration has never been set up here,
+ * `"update"` when it was set up for a different package version, and `undefined` when the current
+ * version is already installed or the version can't be determined. An existing shell hook with no
+ * version marker (a setup from before this marker existed) reads as an update, not a fresh install.
+ */
+export function installHintAction(
+	currentVersion: string | undefined,
+	installedVersion: string | undefined,
+	hookInstalled: boolean,
+): "install" | "update" | undefined {
+	if (!currentVersion) return undefined;
+	if (installedVersion === currentVersion) return undefined;
+	return installedVersion === undefined && !hookInstalled ? "install" : "update";
+}
+
+/** Record that /iterm2-install ran for this version, so the startup hint stops until the next bump. */
+function markInstalledVersion(): void {
+	const version = packageVersion();
+	if (!version) return;
+	try {
+		mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+		writeFileSync(INSTALL_VERSION_PATH, `${version}\n`, { encoding: "utf8", mode: 0o600 });
+	} catch {
+		// A missing marker only means the hint shows again next session; not worth surfacing.
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	const loadedConfig = loadConfig();
 	const config = loadedConfig.config;
@@ -314,7 +366,20 @@ export default function (pi: ExtensionAPI) {
 			}
 			const summary = results.length > 0 ? `Installed:\n${results.join("\n")}` : "Nothing installed.";
 			ctx.ui.notify(nextSteps.length > 0 ? `${summary}\n\nNext:\n${nextSteps.join("\n")}` : summary, "info");
+			// The user has now engaged with setup for this version; silence the startup hint until
+			// the package is upgraded, whatever they chose to install here.
+			markInstalledVersion();
 		},
+	});
+
+	// A once-per-version nudge, since it is otherwise hard to discover that terminal integration
+	// only comes alive after /iterm2-install. Registered before the active check because the
+	// command, and the shell integration it installs, are useful even on hosts where Pi's own
+	// tab coloring is inactive (e.g. a remote shell reached over SSH).
+	pi.on("session_start", (_event, ctx) => {
+		if (ctx.mode !== "tui") return;
+		const action = installHintAction(packageVersion(), lastInstalledVersion(), existsSync(SHELL_HOOK_INSTALL_PATH));
+		if (action) ctx.ui.notify(`Run /iterm2-install to ${action} terminal integration.`, "info");
 	});
 
 	if (!active) return;
